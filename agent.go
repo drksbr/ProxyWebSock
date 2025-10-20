@@ -1,219 +1,574 @@
 package main
 
 import (
-	"bufio"
+	"context"
 	"crypto/tls"
-	"encoding/base64"
-	"encoding/json"
-	"log"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
 	"net"
+	"net/http"
 	"net/url"
-	"strconv"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/spf13/cobra"
 )
 
-var (
-	agentRelayWSS string
+type agentOptions struct {
+	relayURL      string
 	agentID       string
-	agentToken    string
-	agentDialTOms int
-	agentReadBuf  int
-	agentWriteBuf int
-)
-
-var agentCmd = &cobra.Command{
-	Use:   "agent",
-	Short: "Inicia o agente dentro da intranet (conecta no relay via WSS)",
-	RunE: func(cmd *cobra.Command, args []string) error {
-		log.Printf("[agent] iniciando com parâmetros: relay=%s id=%s dialTimeout=%dms readBuf=%d writeBuf=%d", agentRelayWSS, agentID, agentDialTOms, agentReadBuf, agentWriteBuf)
-		cfg := agentCfg{
-			RelayWSS: agentRelayWSS,
-			AgentID:  agentID,
-			Token:    agentToken,
-			DialTO:   time.Duration(agentDialTOms) * time.Millisecond,
-			ReadBuf:  agentReadBuf,
-			WriteBuf: agentWriteBuf,
-		}
-		for {
-			if err := agentRunOnce(cfg); err != nil {
-				log.Println("[agent]", err)
-			}
-			log.Println("[agent] aguardando 2s para tentar reconectar ao relay")
-			time.Sleep(2 * time.Second)
-		}
-	},
+	token         string
+	dialTimeoutMs int
+	readBuffer    int
+	writeBuffer   int
+	maxFrame      int
+	maxInFlight   int
+	reconnectMin  time.Duration
+	reconnectMax  time.Duration
+	relayParsed   *url.URL
+	logger        *slog.Logger
 }
 
-func init() {
-	agentCmd.Flags().StringVar(&agentRelayWSS, "relay", "wss://relay.seudominio.com/tunnel", "URL WSS do relay (/tunnel)")
-	agentCmd.Flags().StringVar(&agentID, "id", "agente-hospital-01", "Agent ID")
-	agentCmd.Flags().StringVar(&agentToken, "token", "um-segredo", "Agent token")
-	agentCmd.Flags().IntVar(&agentDialTOms, "dial-timeout-ms", 10000, "timeout de discagem (ms)")
-	agentCmd.Flags().IntVar(&agentReadBuf, "read-buf", 32*1024, "buffer de leitura (bytes)")
-	agentCmd.Flags().IntVar(&agentWriteBuf, "write-buf", 32*1024, "buffer de escrita (bytes)")
-}
-
-type agentCfg struct {
-	RelayWSS string
-	AgentID  string
-	Token    string
-	DialTO   time.Duration
-	ReadBuf  int
-	WriteBuf int
-}
-
-type aStream struct {
-	Conn net.Conn
-}
-
-func agentRunOnce(cfg agentCfg) error {
-	log.Printf("[agent] agentRunOnce iniciado: relay=%s id=%s dialTO=%s", cfg.RelayWSS, cfg.AgentID, cfg.DialTO)
-	u, _ := url.Parse(cfg.RelayWSS)
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 15 * time.Second,
-		ReadBufferSize:   cfg.ReadBuf,
-		WriteBufferSize:  cfg.WriteBuf,
-		TLSClientConfig:  &tls.Config{InsecureSkipVerify: false}, // ajuste conforme seu certificado
+func newAgentCommand(globals *globalOptions) *cobra.Command {
+	opts := &agentOptions{
+		dialTimeoutMs: 5000,
+		readBuffer:    64 * 1024,
+		writeBuffer:   64 * 1024,
+		maxFrame:      32 * 1024,
+		maxInFlight:   256 * 1024,
+		reconnectMin:  2 * time.Second,
+		reconnectMax:  30 * time.Second,
 	}
-	log.Printf("[agent] abrindo conexão WSS para %s", u.String())
-	ws, resp, err := dialer.Dial(u.String(), nil)
+
+	cmd := &cobra.Command{
+		Use:   "agent",
+		Short: "Agent that originates tunnels from inside the intranet",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if globals.logger == nil {
+				if err := globals.setupLogger(); err != nil {
+					return err
+				}
+			}
+			if err := opts.validate(); err != nil {
+				return err
+			}
+			opts.logger = globals.logger.With("component", "agent")
+			ctx := withSignalContext(context.Background())
+			return runAgent(ctx, opts)
+		},
+	}
+
+	cmd.Flags().StringVar(&opts.relayURL, "relay", "", "relay websocket endpoint (wss://host/tunnel)")
+	cmd.Flags().StringVar(&opts.agentID, "id", "", "agent identifier")
+	cmd.Flags().StringVar(&opts.token, "token", "", "agent shared token")
+	cmd.Flags().IntVar(&opts.dialTimeoutMs, "dial-timeout-ms", opts.dialTimeoutMs, "timeout in milliseconds for dialing internal targets")
+	cmd.Flags().IntVar(&opts.readBuffer, "read-buf", opts.readBuffer, "TCP read buffer size per stream")
+	cmd.Flags().IntVar(&opts.writeBuffer, "write-buf", opts.writeBuffer, "websocket write buffer size")
+	cmd.Flags().IntVar(&opts.maxFrame, "max-frame", opts.maxFrame, "maximum payload size per frame in bytes")
+	cmd.Flags().IntVar(&opts.maxInFlight, "max-inflight", opts.maxInFlight, "maximum unacknowledged bytes per stream (0 disables)")
+
+	return cmd
+}
+
+func (o *agentOptions) validate() error {
+	if o.relayURL == "" {
+		return errors.New("--relay is required")
+	}
+	parsed, err := url.Parse(o.relayURL)
 	if err != nil {
-		if resp != nil {
-			log.Printf("[agent] resposta do relay na falha: status=%s", resp.Status)
+		return fmt.Errorf("invalid relay url: %w", err)
+	}
+	if parsed.Scheme != "wss" && parsed.Scheme != "ws" {
+		return errors.New("relay url must use ws or wss scheme")
+	}
+	if parsed.Host == "" {
+		return errors.New("relay url missing host")
+	}
+	o.relayParsed = parsed
+
+	if o.agentID == "" || o.token == "" {
+		return errors.New("--id and --token are required")
+	}
+	if o.maxFrame <= 0 {
+		return errors.New("--max-frame must be positive")
+	}
+	if o.readBuffer <= 0 || o.writeBuffer <= 0 {
+		return errors.New("buffers must be positive")
+	}
+	if o.reconnectMin <= 0 {
+		o.reconnectMin = 2 * time.Second
+	}
+	if o.reconnectMax < o.reconnectMin {
+		o.reconnectMax = o.reconnectMin
+	}
+	return nil
+}
+
+func runAgent(ctx context.Context, opts *agentOptions) error {
+	a := &agent{
+		opts:   opts,
+		logger: opts.logger,
+	}
+	return a.run(ctx)
+}
+
+type agent struct {
+	opts   *agentOptions
+	logger *slog.Logger
+}
+
+func (a *agent) run(ctx context.Context) error {
+	backoff := a.opts.reconnectMin
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-		log.Printf("[agent] falha ao conectar ao relay %s: %v", u.String(), err)
+		start := time.Now()
+		err := a.connectOnce(ctx)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		if err != nil {
+			a.logger.Warn("connection failed", "error", err)
+		} else {
+			a.logger.Info("connection terminated, reconnecting")
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if time.Since(start) > time.Minute {
+			backoff = a.opts.reconnectMin
+		}
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if backoff < a.opts.reconnectMax {
+			backoff *= 2
+			if backoff > a.opts.reconnectMax {
+				backoff = a.opts.reconnectMax
+			}
+		}
+	}
+}
+
+func (a *agent) connectOnce(ctx context.Context) error {
+	dialer := websocket.Dialer{
+		Proxy:             http.ProxyFromEnvironment,
+		HandshakeTimeout:  15 * time.Second,
+		EnableCompression: false,
+		ReadBufferSize:    a.opts.readBuffer,
+		WriteBufferSize:   a.opts.writeBuffer,
+	}
+	if a.opts.relayParsed.Scheme == "wss" {
+		dialer.TLSClientConfig = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			ServerName: a.opts.relayParsed.Hostname(),
+		}
+	}
+
+	header := http.Header{
+		"User-Agent": {fmt.Sprintf("intratun-agent/%s", version)},
+	}
+
+	conn, resp, err := dialer.DialContext(ctx, a.opts.relayURL, header)
+	if err != nil {
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
 		return err
 	}
-	defer ws.Close()
-	var localAddr, remoteAddr string
-	if conn := ws.UnderlyingConn(); conn != nil {
-		localAddr = conn.LocalAddr().String()
-		remoteAddr = conn.RemoteAddr().String()
+	if resp != nil && resp.Body != nil {
+		resp.Body.Close()
 	}
-	log.Printf("[agent] conectado ao relay %s (local=%s remote=%s)", cfg.RelayWSS, localAddr, remoteAddr)
 
-	// registra
-	if err := ws.WriteJSON(frame{Op: "register", AgentID: cfg.AgentID, Token: cfg.Token}); err != nil {
-		log.Printf("[agent] erro enviando frame register: %v", err)
+	session := newAgentSession(a, conn)
+	return session.run(ctx)
+}
+
+type agentSession struct {
+	agent *agent
+	conn  *websocket.Conn
+
+	streams   map[string]*agentStream
+	streamsMu sync.RWMutex
+
+	writeMu sync.Mutex
+	logger  *slog.Logger
+}
+
+func newAgentSession(agent *agent, conn *websocket.Conn) *agentSession {
+	return &agentSession{
+		agent:   agent,
+		conn:    conn,
+		streams: make(map[string]*agentStream),
+		logger:  agent.logger.With("session", time.Now().UnixNano()),
+	}
+}
+
+func (s *agentSession) run(ctx context.Context) error {
+	defer s.conn.Close()
+
+	s.conn.SetReadLimit(1 << 20)
+	if err := s.register(); err != nil {
 		return err
 	}
-	log.Printf("[agent] frame register enviado com sucesso (id=%s)", cfg.AgentID)
 
-	streams := make(map[string]*aStream)
-	log.Printf("[agent] mapa de streams inicializado (cap=%d)", len(streams))
-
-	// leitor do relay
-	errCh := make(chan error, 1)
+	readErr := make(chan error, 1)
 	go func() {
-		log.Printf("[agent] goroutine de leitura do relay iniciada")
-		for {
-			mt, data, err := ws.ReadMessage()
-			if err != nil {
-				log.Printf("[agent] erro lendo mensagem do relay: %v", err)
-				errCh <- err
-				return
-			}
-			if mt != websocket.TextMessage {
-				log.Printf("[agent] ignorando frame não textual tipo=%d", mt)
-				continue
-			}
-			var f frame
-			if json.Unmarshal(data, &f) != nil {
-				log.Printf("[agent] frame JSON inválido recebido: %s", string(data))
-				continue
-			}
-			log.Printf("[agent] frame recebido do relay: op=%s stream=%s payload=%d bytes", f.Op, f.StreamID, len(f.Payload))
-			switch f.Op {
-			case "dial":
-				go func(f frame) {
-					addr := net.JoinHostPort(f.Host, strconv.Itoa(f.Port))
-					log.Printf("[agent] solicitada nova conexão stream=%s destino=%s", f.StreamID, addr)
-					conn, err := net.DialTimeout("tcp", addr, cfg.DialTO)
-					if err != nil {
-						log.Printf("[agent] erro ao conectar no destino %s stream=%s: %v", addr, f.StreamID, err)
-						if err := ws.WriteJSON(frame{Op: "err", StreamID: f.StreamID, Message: err.Error()}); err != nil {
-							log.Printf("[agent] erro enviando frame err stream=%s: %v", f.StreamID, err)
-						}
-						return
-					}
-					streams[f.StreamID] = &aStream{Conn: conn}
-					log.Printf("[agent] conexão estabelecida stream=%s destino=%s", f.StreamID, addr)
-					// destino interno -> relay
-					go func(id string, c net.Conn) {
-						log.Printf("[agent] iniciando leitura do destino stream=%s remoto=%s", id, c.RemoteAddr())
-						r := bufio.NewReader(c)
-						buf := make([]byte, cfg.ReadBuf)
-						for {
-							n, err := r.Read(buf)
-							if n > 0 {
-								log.Printf("[agent] stream=%s destino->relay leu %d bytes", id, n)
-								if err := ws.WriteJSON(frame{Op: "write", StreamID: id, Payload: base64.StdEncoding.EncodeToString(buf[:n])}); err != nil {
-									log.Printf("[agent] erro enviando frame write stream=%s: %v", id, err)
-									break
-								}
-							}
-							if err != nil {
-								log.Printf("[agent] leitura encerrada stream=%s: %v", id, err)
-								break
-							}
-						}
-						if err := ws.WriteJSON(frame{Op: "close", StreamID: id}); err != nil {
-							log.Printf("[agent] erro enviando frame close stream=%s: %v", id, err)
-						}
-						log.Printf("[agent] enviado close stream=%s após término da leitura", id)
-						_ = c.Close()
-						delete(streams, id)
-						log.Printf("[agent] stream=%s removido (restantes=%d)", id, len(streams))
-					}(f.StreamID, conn)
-				}(f)
-			case "write":
-				if s, ok := streams[f.StreamID]; ok {
-					p, decodeErr := base64.StdEncoding.DecodeString(f.Payload)
-					if decodeErr != nil {
-						log.Printf("[agent] erro decodificando payload base64 stream=%s: %v", f.StreamID, decodeErr)
-						continue
-					}
-					if len(p) > 0 {
-						log.Printf("[agent] stream=%s relay->destino escrevendo %d bytes", f.StreamID, len(p))
-						if _, err := s.Conn.Write(p); err != nil {
-							log.Printf("[agent] erro escrevendo no destino stream=%s: %v", f.StreamID, err)
-						}
-					}
-				} else {
-					log.Printf("[agent] write recebido para stream desconhecida %s", f.StreamID)
-				}
-			case "close":
-				if s, ok := streams[f.StreamID]; ok {
-					_ = s.Conn.Close()
-					delete(streams, f.StreamID)
-					log.Printf("[agent] destino fechou stream=%s (restantes=%d)", f.StreamID, len(streams))
-				} else {
-					log.Printf("[agent] close recebido para stream desconhecida %s", f.StreamID)
-				}
-			}
-		}
+		readErr <- s.readLoop()
 	}()
 
-	// keepalive
-	ping := time.NewTicker(20 * time.Second)
-	defer ping.Stop()
-	log.Printf("[agent] ticker de ping iniciado (20s)")
+	pingTicker := time.NewTicker(20 * time.Second)
+	defer pingTicker.Stop()
 
 	for {
 		select {
-		case <-ping.C:
-			deadline := time.Now().Add(5 * time.Second)
-			if err := ws.WriteControl(websocket.PingMessage, []byte("ping"), deadline); err != nil {
-				log.Printf("[agent] erro enviando ping: %v", err)
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-readErr:
+			return err
+		case <-pingTicker.C:
+			if err := s.sendControl(websocket.PingMessage); err != nil {
 				return err
 			}
-			log.Printf("[agent] ping enviado ao relay (deadline=%s)", deadline)
-		case err := <-errCh:
-			log.Printf("[agent] erro de leitura do relay recebido: %v", err)
-			return err
 		}
 	}
+}
+
+func (s *agentSession) register() error {
+	if err := s.conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return err
+	}
+	if err := s.conn.WriteJSON(&frame{
+		Type:    frameTypeRegister,
+		AgentID: s.agent.opts.agentID,
+		Token:   s.agent.opts.token,
+	}); err != nil {
+		return fmt.Errorf("send register: %w", err)
+	}
+	if err := s.conn.SetWriteDeadline(time.Time{}); err != nil {
+		return err
+	}
+	readDeadline := 30 * time.Second
+	if err := s.conn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
+		return err
+	}
+	s.conn.SetPongHandler(func(string) error {
+		return s.conn.SetReadDeadline(time.Now().Add(readDeadline))
+	})
+	return nil
+}
+
+func (s *agentSession) readLoop() error {
+	for {
+		var f frame
+		if err := s.conn.ReadJSON(&f); err != nil {
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return err
+		}
+
+		switch f.Type {
+		case frameTypeDial:
+			go s.handleDial(f)
+		case frameTypeWrite:
+			s.handleWrite(f)
+		case frameTypeClose:
+			s.handleClose(f)
+		case frameTypeError:
+			s.handleRelayError(f)
+		default:
+			s.logger.Warn("unknown frame type", "type", f.Type)
+		}
+	}
+}
+
+func (s *agentSession) handleDial(f frame) {
+	if f.StreamID == "" {
+		s.logger.Warn("dial missing streamId")
+		return
+	}
+	address := net.JoinHostPort(f.Host, fmt.Sprintf("%d", f.Port))
+
+	timeout := time.Duration(s.agent.opts.dialTimeoutMs) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+
+	conn, err := net.DialTimeout("tcp", address, timeout)
+	if err != nil {
+		s.logger.Warn("dial failed", "stream", f.StreamID, "target", address, "error", err)
+		_ = s.sendFrame(&frame{
+			Type:     frameTypeError,
+			StreamID: f.StreamID,
+			Error:    err.Error(),
+		})
+		return
+	}
+
+	stream := newAgentStream(f.StreamID, conn, s.agent.opts.maxInFlight)
+	if err := s.storeStream(stream); err != nil {
+		s.logger.Warn("stream register failed", "stream", f.StreamID, "error", err)
+		conn.Close()
+		_ = s.sendFrame(&frame{
+			Type:     frameTypeError,
+			StreamID: f.StreamID,
+			Error:    err.Error(),
+		})
+		return
+	}
+
+	if err := s.sendFrame(&frame{
+		Type:     frameTypeDial,
+		StreamID: f.StreamID,
+	}); err != nil {
+		s.logger.Warn("send dial ack failed", "stream", f.StreamID, "error", err)
+		stream.close()
+		return
+	}
+
+	go s.pipeOutbound(stream)
+}
+
+func (s *agentSession) handleWrite(f frame) {
+	stream := s.getStream(f.StreamID)
+	if stream == nil {
+		s.logger.Warn("write for unknown stream", "stream", f.StreamID)
+		return
+	}
+	payload, err := decodePayload(f.Payload)
+	if err != nil {
+		s.logger.Warn("payload decode failed", "stream", f.StreamID, "error", err)
+		return
+	}
+	if len(payload) == 0 {
+		return
+	}
+
+	total := 0
+	for total < len(payload) {
+		n, err := stream.conn.Write(payload[total:])
+		if err != nil {
+			s.logger.Warn("stream write failed", "stream", f.StreamID, "error", err)
+			stream.close()
+			_ = s.sendFrame(&frame{
+				Type:     frameTypeError,
+				StreamID: f.StreamID,
+				Error:    err.Error(),
+			})
+			return
+		}
+		total += n
+	}
+}
+
+func (s *agentSession) handleClose(f frame) {
+	stream := s.removeStream(f.StreamID)
+	if stream == nil {
+		return
+	}
+	stream.close()
+	if f.Error != "" {
+		s.logger.Info("stream closed by relay", "stream", f.StreamID, "error", f.Error)
+	}
+}
+
+func (s *agentSession) handleRelayError(f frame) {
+	stream := s.removeStream(f.StreamID)
+	if stream != nil {
+		stream.close()
+	}
+	if f.Error != "" {
+		s.logger.Warn("relay reported error", "stream", f.StreamID, "error", f.Error)
+	}
+}
+
+func (s *agentSession) sendFrame(f *frame) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.conn.SetWriteDeadline(time.Now().Add(20 * time.Second)); err != nil {
+		return err
+	}
+	err := s.conn.WriteJSON(f)
+	if err == nil {
+		err = s.conn.SetWriteDeadline(time.Time{})
+	}
+	return err
+}
+
+func (s *agentSession) sendControl(messageType int) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.conn.WriteControl(messageType, nil, time.Now().Add(10*time.Second))
+}
+
+func (s *agentSession) storeStream(stream *agentStream) error {
+	s.streamsMu.Lock()
+	defer s.streamsMu.Unlock()
+	if _, exists := s.streams[stream.id]; exists {
+		return fmt.Errorf("stream %s already exists", stream.id)
+	}
+	s.streams[stream.id] = stream
+	return nil
+}
+
+func (s *agentSession) getStream(id string) *agentStream {
+	s.streamsMu.RLock()
+	defer s.streamsMu.RUnlock()
+	return s.streams[id]
+}
+
+func (s *agentSession) removeStream(id string) *agentStream {
+	s.streamsMu.Lock()
+	defer s.streamsMu.Unlock()
+	stream, ok := s.streams[id]
+	if ok {
+		delete(s.streams, id)
+	}
+	return stream
+}
+
+func (s *agentSession) pipeOutbound(stream *agentStream) {
+	defer func() {
+		s.removeStream(stream.id)
+		stream.close()
+		_ = s.sendFrame(&frame{
+			Type:     frameTypeClose,
+			StreamID: stream.id,
+		})
+	}()
+
+	bufferSize := s.agent.opts.maxFrame
+	if bufferSize > s.agent.opts.readBuffer {
+		bufferSize = s.agent.opts.readBuffer
+	}
+	if bufferSize <= 0 {
+		bufferSize = 32 * 1024
+	}
+
+	buf := make([]byte, bufferSize)
+	for {
+		n, err := stream.conn.Read(buf)
+		if n > 0 {
+			chunk := buf[:n]
+			stream.acquire(n)
+			errSend := s.sendFrame(&frame{
+				Type:     frameTypeWrite,
+				StreamID: stream.id,
+				Payload:  encodePayload(chunk),
+			})
+			stream.release(n)
+			if errSend != nil {
+				s.logger.Warn("send payload failed", "stream", stream.id, "error", errSend)
+				return
+			}
+		}
+
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return
+			}
+			s.logger.Warn("stream read failed", "stream", stream.id, "error", err)
+			_ = s.sendFrame(&frame{
+				Type:     frameTypeError,
+				StreamID: stream.id,
+				Error:    err.Error(),
+			})
+			return
+		}
+	}
+}
+
+type agentStream struct {
+	id        string
+	conn      net.Conn
+	limiter   *byteLimiter
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newAgentStream(id string, conn net.Conn, maxInFlight int) *agentStream {
+	return &agentStream{
+		id:      id,
+		conn:    conn,
+		limiter: newByteLimiter(maxInFlight),
+		closed:  make(chan struct{}),
+	}
+}
+
+func (s *agentStream) close() {
+	s.closeOnce.Do(func() {
+		close(s.closed)
+		s.conn.Close()
+		s.limiter.Close()
+	})
+}
+
+func (s *agentStream) acquire(n int) {
+	if s.limiter != nil {
+		s.limiter.Acquire(n)
+	}
+}
+
+func (s *agentStream) release(n int) {
+	if s.limiter != nil {
+		s.limiter.Release(n)
+	}
+}
+
+type byteLimiter struct {
+	max  int
+	mu   sync.Mutex
+	cond *sync.Cond
+	used int
+}
+
+func newByteLimiter(max int) *byteLimiter {
+	if max <= 0 {
+		return nil
+	}
+	l := &byteLimiter{max: max}
+	l.cond = sync.NewCond(&l.mu)
+	return l
+}
+
+func (b *byteLimiter) Acquire(n int) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for b.used+n > b.max {
+		b.cond.Wait()
+	}
+	b.used += n
+}
+
+func (b *byteLimiter) Release(n int) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	b.used -= n
+	if b.used < 0 {
+		b.used = 0
+	}
+	b.mu.Unlock()
+	b.cond.Broadcast()
+}
+
+func (b *byteLimiter) Close() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	b.used = 0
+	b.mu.Unlock()
+	b.cond.Broadcast()
 }

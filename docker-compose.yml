@@ -1,42 +1,49 @@
 version: "3.9"
+
 services:
   relay:
-    build: .
+    build:
+      context: .
+    image: intratun:latest
     command:
-      [
-        "relay",
-        "--listen",
-        ":3000",
-        "--agents",
-        "agente-hospital-01:um-segredo",
-        "--acl-allow",
-        "^([a-zA-Z0-9\\.-]+):443$",
-        "--metrics",
-        ":9091",
-        "--max-frame",
-        "131072",
-        "--ws-idle",
-        "120",
-        "--dial-timeout-ms",
-        "10000",
-      ]
+      - relay
+      - --listen=:8080
+      - --metrics=:9090
+      - --agents=intra:changeme
+      - --acl-allow=^.*:443$
+    environment:
+      - TZ=UTC
     expose:
-      - "3000"
-      - "9091"
-    restart: unless-stopped
+      - "8080"
+    ports:
+      - "9090:9090"
+    networks:
+      - intratun
 
   caddy:
     image: caddy:2.8
-    depends_on: [relay]
+    depends_on:
+      - relay
     ports:
-      - "80:80"
       - "443:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    restart: unless-stopped
+    networks:
+      - intratun
 
-volumes:
-  caddy_data: {}
-  caddy_config: {}
+  agent:
+    image: intratun:latest
+    command:
+      - agent
+      - --relay=ws://relay:8080/tunnel
+      - --id=intra
+      - --token=changeme
+      - --dial-timeout-ms=5000
+      - --max-frame=32768
+    depends_on:
+      - relay
+    networks:
+      - intratun
+
+networks:
+  intratun: {}
