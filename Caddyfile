@@ -1,28 +1,19 @@
-:443 {
+{
+	auto_https off
+}
+
+# Optional Caddy front-end for the plain HTTP proxy when you want
+# additional logging or middleware. The relay itself terminates TLS for
+# /tunnel and the dashboard (port 8443).
+:8080 {
 	log {
 		output stdout
 		format console
 		level INFO
 	}
 
-	encode gzip zstd
-
-	@tunnel {
-		path /tunnel
-	}
-
 	@connect {
 		method CONNECT
-	}
-
-	handle @tunnel {
-		reverse_proxy relay:8080 {
-			transport http {
-				versions h1
-				ping_interval 15s
-				read_buffer 65536
-			}
-		}
 	}
 
 	handle @connect {
@@ -34,10 +25,6 @@
 	}
 
 	handle {
-		reverse_proxy relay:8080 {
-			transport http {
-				versions h1
-			}
-		}
+		respond "Intratun HTTP proxy is available on this endpoint." 200
 	}
 }

@@ -7,41 +7,39 @@ services:
     image: intratun:latest
     command:
       - relay
-      - --listen=:8080
-      - --metrics=:9090
+      - --proxy-listen=:8080
+      - --secure-listen=:8443
+      - --socks-listen=:1080
       - --agents=intra:changeme
       - --acl-allow=^.*:443$
+      - --acme-host=relay.example.com
+      - --acme-email=ops@example.com
+      - --acme-cache=/var/lib/intratun/acme
     environment:
       - TZ=UTC
-    expose:
-      - "8080"
-    ports:
-      - "9090:9090"
-    networks:
-      - intratun
-
-  caddy:
-    image: caddy:2.8
-    depends_on:
-      - relay
-    ports:
-      - "443:443"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./acme-cache:/var/lib/intratun/acme
+    ports:
+      - "8080:8080"   # HTTP CONNECT
+      - "8443:8443"   # WSS, dashboard, metrics
+      - "1080:1080"   # Optional SOCKS5
     networks:
       - intratun
 
   agent:
     image: intratun:latest
+    profiles:
+      - agent
     command:
       - agent
-      - --relay=ws://relay:8080/tunnel
+      - --relay=wss://relay.example.com:8443/tunnel
       - --id=intra
       - --token=changeme
       - --dial-timeout-ms=5000
-      - --max-frame=32768
-    depends_on:
-      - relay
+    environment:
+      - TZ=UTC
+    extra_hosts:
+      - "relay.example.com:host-gateway" # adjust or remove depending on DNS setup
     networks:
       - intratun
 
