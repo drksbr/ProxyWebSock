@@ -4,6 +4,11 @@ ProxyWebSock lets you surface private intranet applications to the public intern
 
 ---
 
+![Proxy dashboard overview](https://github.com/drksbr/ProxyWebSock/raw/main/screenshot1.png)
+![Proxy metrics chart](https://github.com/drksbr/ProxyWebSock/raw/main/screenshot2.png)
+
+---
+
 ## Contents
 
 - [Architecture](#architecture)
@@ -142,11 +147,6 @@ The agent reconnects automatically with exponential backoff and resolves DNS ins
 | `--max-frame`                | Max chunk size to relay           |
 | `--read-buf` / `--write-buf` | Socket and WebSocket buffer sizes |
 | `--max-inflight`             | Per-stream backpressure limit     |
-
----
-
-![Proxy dashboard overview](https://github.com/drksbr/ProxyWebSock/raw/main/screenshot1.png)
-![Proxy metrics chart](https://github.com/drksbr/ProxyWebSock/raw/main/screenshot2.png)
 
 ## Dashboard & Monitoring
 
