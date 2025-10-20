@@ -1,0 +1,25 @@
+{
+  email isaacramonpb@gmail.com
+}
+
+relay.neurocirurgiahgrs.com.br {
+  encode zstd gzip
+  
+  # WebSocket dos agentes
+  reverse_proxy /tunnel* relay:3000 {
+    header_up Host {host}
+    header_up X-Forwarded-Proto {scheme}
+    transport http {
+      versions h2c 1.1
+    }
+  }
+
+  # Proxy CONNECT do navegador (raiz)
+  @connect method CONNECT
+  handle @connect {
+    reverse_proxy relay:3000
+  }
+
+  # Métricas
+  reverse_proxy /metrics relay:3000
+}

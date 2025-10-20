@@ -1,0 +1,42 @@
+version: "3.9"
+services:
+  relay:
+    build: .
+    command:
+      [
+        "relay",
+        "--listen",
+        ":3000",
+        "--agents",
+        "agente-hospital-01:um-segredo",
+        "--acl-allow",
+        "^([a-zA-Z0-9\\.-]+):443$",
+        "--metrics",
+        ":9091",
+        "--max-frame",
+        "131072",
+        "--ws-idle",
+        "120",
+        "--dial-timeout-ms",
+        "10000",
+      ]
+    expose:
+      - "3000"
+      - "9091"
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.8
+    depends_on: [relay]
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+
+volumes:
+  caddy_data: {}
+  caddy_config: {}
