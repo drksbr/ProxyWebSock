@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
+	_ "embed"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
@@ -125,7 +127,11 @@ type relayServer struct {
 	secureLn    net.Listener
 	socksLn     net.Listener
 	stats       relayCounters
+	resources   *resourceTracker
 }
+
+//go:embed dashboard.html
+var statusTemplateHTML string
 
 func newRelayServer(logger *slog.Logger, opts *relayOptions) (*relayServer, error) {
 	agentTokens, err := parseAgentEntries(opts.agentEntries)
@@ -150,6 +156,7 @@ func newRelayServer(logger *slog.Logger, opts *relayOptions) (*relayServer, erro
 	}
 
 	metrics := newRelayMetrics()
+	resources := newResourceTracker()
 
 	if opts.acmeCache != "" {
 		if err := os.MkdirAll(opts.acmeCache, 0o750); err != nil {
@@ -166,7 +173,7 @@ func newRelayServer(logger *slog.Logger, opts *relayOptions) (*relayServer, erro
 		acmeManager.Cache = autocert.DirCache(opts.acmeCache)
 	}
 
-	tmpl, err := template.New("status").Funcs(statusTemplateFuncMap).Parse(statusTemplateHTML)
+	tmpl, err := template.New("status").Parse(statusTemplateHTML)
 	if err != nil {
 		return nil, fmt.Errorf("parse status template: %w", err)
 	}
@@ -177,6 +184,7 @@ func newRelayServer(logger *slog.Logger, opts *relayOptions) (*relayServer, erro
 		metrics:     metrics,
 		agentTokens: agentTokens,
 		acl:         acl,
+		resources:   resources,
 		acmeManager: acmeManager,
 		statusTmpl:  tmpl,
 		upgrader: websocket.Upgrader{
@@ -192,6 +200,10 @@ func newRelayServer(logger *slog.Logger, opts *relayOptions) (*relayServer, erro
 func (s *relayServer) run(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
 	defer s.cancel()
+
+	if s.resources != nil {
+		s.resources.start(s.ctx)
+	}
 
 	errCh := make(chan error, 1)
 	sendErr := func(err error) {
@@ -239,6 +251,7 @@ func (s *relayServer) run(ctx context.Context) error {
 	secureMux.Handle("/metrics", promhttp.Handler())
 	secureMux.Handle("/tunnel", http.HandlerFunc(s.handleTunnel))
 	secureMux.Handle("/autoconfig/", http.HandlerFunc(s.handleAutoConfig))
+	secureMux.Handle("/status.json", http.HandlerFunc(s.handleStatusJSON))
 	secureMux.Handle("/", http.HandlerFunc(s.handleStatus))
 
 	s.secureSrv = &http.Server{
@@ -324,11 +337,29 @@ func (s *relayServer) handleTunnel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *relayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
-	view := s.snapshotStatus(r)
+	payload := s.collectStatus(r)
+	jsonBytes, err := json.Marshal(payload)
+	if err != nil {
+		s.logger.Warn("status marshal failed", "error", err)
+		http.Error(w, "status error", http.StatusInternalServerError)
+		return
+	}
+	view := statusView{
+		Bootstrap: template.JS(jsonBytes),
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := s.statusTmpl.Execute(w, view); err != nil {
 		s.logger.Warn("status render failed", "error", err)
 		http.Error(w, "render error", http.StatusInternalServerError)
+	}
+}
+
+func (s *relayServer) handleStatusJSON(w http.ResponseWriter, r *http.Request) {
+	payload := s.collectStatus(r)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		s.logger.Warn("status json failed", "error", err)
 	}
 }
 
@@ -583,7 +614,7 @@ func (s *relayServer) handleSocksConn(conn net.Conn) {
 	go stream.pipeClientOutbound()
 }
 
-func (s *relayServer) snapshotStatus(r *http.Request) statusView {
+func (s *relayServer) collectStatus(r *http.Request) statusPayload {
 	agents := make([]statusAgent, 0)
 	s.agents.Range(func(_, value any) bool {
 		if session, ok := value.(*relayAgentSession); ok {
@@ -603,7 +634,12 @@ func (s *relayServer) snapshotStatus(r *http.Request) statusView {
 		totalStreams += len(agent.Streams)
 	}
 
-	view := statusView{
+	resources := resourceSnapshot{}
+	if s.resources != nil {
+		resources = s.resources.snapshot()
+	}
+
+	return statusPayload{
 		GeneratedAt: time.Now(),
 		ProxyAddr:   s.opts.proxyListen,
 		SecureAddr:  s.opts.secureListen,
@@ -618,8 +654,8 @@ func (s *relayServer) snapshotStatus(r *http.Request) statusView {
 			DialErrors:      s.stats.dialErrors.Load(),
 			AuthFailures:    s.stats.authFailures.Load(),
 		},
+		Resources: resources,
 	}
-	return view
 }
 
 func readSocksCredentials(conn net.Conn) (string, string, error) {
@@ -706,95 +742,45 @@ func writeSocksReply(conn net.Conn, rep byte) error {
 	return err
 }
 
+type statusPayload struct {
+	GeneratedAt time.Time        `json:"generatedAt"`
+	ProxyAddr   string           `json:"proxyAddr"`
+	SecureAddr  string           `json:"secureAddr"`
+	SocksAddr   string           `json:"socksAddr"`
+	ACMEHosts   []string         `json:"acmeHosts"`
+	Agents      []statusAgent    `json:"agents"`
+	Metrics     statusMetrics    `json:"metrics"`
+	Resources   resourceSnapshot `json:"resources"`
+}
+
 type statusView struct {
-	GeneratedAt time.Time
-	ProxyAddr   string
-	SecureAddr  string
-	SocksAddr   string
-	ACMEHosts   []string
-	Agents      []statusAgent
-	Metrics     statusMetrics
+	Bootstrap template.JS
 }
 
 type statusMetrics struct {
-	AgentsConnected int
-	ActiveStreams   int
-	BytesUp         int64
-	BytesDown       int64
-	DialErrors      int64
-	AuthFailures    int64
+	AgentsConnected int   `json:"agentsConnected"`
+	ActiveStreams   int   `json:"activeStreams"`
+	BytesUp         int64 `json:"bytesUp"`
+	BytesDown       int64 `json:"bytesDown"`
+	DialErrors      int64 `json:"dialErrors"`
+	AuthFailures    int64 `json:"authFailures"`
 }
 
 type statusAgent struct {
-	ID          string
-	Remote      string
-	ConnectedAt time.Time
-	Streams     []statusStream
-	AutoConfig  string
+	ID          string         `json:"id"`
+	Remote      string         `json:"remote"`
+	ConnectedAt time.Time      `json:"connectedAt"`
+	Streams     []statusStream `json:"streams"`
+	AutoConfig  string         `json:"autoConfig"`
 }
 
 type statusStream struct {
-	StreamID  string
-	Target    string
-	Protocol  string
-	CreatedAt time.Time
-	BytesUp   int64
-	BytesDown int64
-}
-
-var statusTemplateFuncMap = template.FuncMap{
-	"since":      humanSince,
-	"formatTime": humanTime,
-	"humanBytes": humanBytes,
-}
-
-func humanSince(t time.Time) string {
-	if t.IsZero() {
-		return "n/a"
-	}
-	d := time.Since(t)
-	if d < 0 {
-		d = -d
-	}
-	return d.Truncate(time.Second).String()
-}
-
-func humanTime(t time.Time) string {
-	if t.IsZero() {
-		return "n/a"
-	}
-	return t.Local().Format(time.RFC3339)
-}
-
-func humanBytes(v any) string {
-	var value float64
-	switch n := v.(type) {
-	case float64:
-		value = n
-	case float32:
-		value = float64(n)
-	case int64:
-		value = float64(n)
-	case int32:
-		value = float64(n)
-	case int:
-		value = float64(n)
-	default:
-		return "-"
-	}
-	if value < 1024 {
-		return fmt.Sprintf("%.0f B", value)
-	}
-	units := []string{"KiB", "MiB", "GiB", "TiB", "PiB"}
-	div, exp := 1024.0, 0
-	for value >= div && exp < len(units) {
-		value /= 1024
-		exp++
-		if exp == len(units) {
-			break
-		}
-	}
-	return fmt.Sprintf("%.2f %s", value, units[exp-1])
+	StreamID  string    `json:"streamId"`
+	Target    string    `json:"target"`
+	Protocol  string    `json:"protocol"`
+	CreatedAt time.Time `json:"createdAt"`
+	BytesUp   int64     `json:"bytesUp"`
+	BytesDown int64     `json:"bytesDown"`
 }
 
 func hostOnly(hostport string) string {
@@ -859,130 +845,6 @@ func (s *relayServer) autoConfigURL(r *http.Request, agentID string) string {
 	}
 	return fmt.Sprintf("%s://%s/autoconfig/%s.pac?token=%s", scheme, host, url.PathEscape(agentID), url.QueryEscape(token))
 }
-
-const statusTemplateHTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Intratun Relay Status</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-slate-950 text-slate-100">
-  <div class="max-w-6xl mx-auto px-4 py-8 space-y-10">
-    <header class="space-y-4">
-      <h1 class="text-3xl font-semibold tracking-tight">Intratun Relay</h1>
-      <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-        <div class="rounded-lg border border-slate-800 bg-slate-900/60 p-4">
-          <div class="text-sm text-slate-400">Proxy (HTTP CONNECT)</div>
-          <div class="text-lg font-mono mt-1">{{.ProxyAddr}}</div>
-        </div>
-        <div class="rounded-lg border border-slate-800 bg-slate-900/60 p-4">
-          <div class="text-sm text-slate-400">Secure (WSS / Metrics)</div>
-          <div class="text-lg font-mono mt-1">{{.SecureAddr}}</div>
-        </div>
-        <div class="rounded-lg border border-slate-800 bg-slate-900/60 p-4">
-          <div class="text-sm text-slate-400">SOCKS5</div>
-          <div class="text-lg font-mono mt-1">{{if .SocksAddr}}{{.SocksAddr}}{{else}}disabled{{end}}</div>
-        </div>
-      </div>
-      <div class="rounded-lg border border-slate-800 bg-slate-900/60 p-4">
-        <div class="text-sm text-slate-400 mb-2">ACME Hosts</div>
-        <div class="font-mono text-sm">{{range .ACMEHosts}}{{.}} {{end}}</div>
-      </div>
-    </header>
-
-    <section>
-      <h2 class="text-xl font-semibold mb-4">Resumo</h2>
-      <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-        <div class="rounded-lg border border-slate-800 bg-slate-900/60 p-4">
-          <div class="text-sm text-slate-400">Agentes Conectados</div>
-          <div class="text-3xl font-semibold mt-1">{{.Metrics.AgentsConnected}}</div>
-        </div>
-        <div class="rounded-lg border border-slate-800 bg-slate-900/60 p-4">
-          <div class="text-sm text-slate-400">Streams Ativas</div>
-          <div class="text-3xl font-semibold mt-1">{{.Metrics.ActiveStreams}}</div>
-        </div>
-        <div class="rounded-lg border border-slate-800 bg-slate-900/60 p-4">
-          <div class="text-sm text-slate-400">Bytes (cliente → intranet)</div>
-          <div class="text-lg font-mono mt-1">{{humanBytes .Metrics.BytesUp}}</div>
-        </div>
-        <div class="rounded-lg border border-slate-800 bg-slate-900/60 p-4">
-          <div class="text-sm text-slate-400">Bytes (intranet → cliente)</div>
-          <div class="text-lg font-mono mt-1">{{humanBytes .Metrics.BytesDown}}</div>
-        </div>
-        <div class="rounded-lg border border-slate-800 bg-slate-900/60 p-4">
-          <div class="text-sm text-slate-400">Falhas de Dial</div>
-          <div class="text-lg font-mono mt-1">{{.Metrics.DialErrors}}</div>
-        </div>
-        <div class="rounded-lg border border-slate-800 bg-slate-900/60 p-4">
-          <div class="text-sm text-slate-400">Falhas de Autenticação</div>
-          <div class="text-lg font-mono mt-1">{{.Metrics.AuthFailures}}</div>
-        </div>
-      </div>
-    </section>
-
-    <section>
-      <div class="flex items-center justify-between mb-4">
-        <h2 class="text-xl font-semibold">Agentes</h2>
-        <div class="text-sm text-slate-400">Atualizado {{formatTime .GeneratedAt}}</div>
-      </div>
-      {{if .Agents}}
-      <div class="space-y-6">
-        {{range .Agents}}
-        <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-5 space-y-4">
-          <div class="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-            <div>
-              <div class="text-lg font-semibold">{{.ID}}</div>
-              <div class="text-sm text-slate-400">Remoto {{.Remote}} · Conectado há {{since .ConnectedAt}}</div>
-              {{if .AutoConfig}}
-              <div class="text-sm"><a class="text-teal-400 hover:text-teal-200" href="{{.AutoConfig}}">Download PAC</a></div>
-              {{end}}
-            </div>
-            <div class="text-sm text-slate-400">{{len .Streams}} streams ativas</div>
-          </div>
-          {{if .Streams}}
-          <div class="overflow-x-auto">
-            <table class="min-w-full divide-y divide-slate-800 text-sm">
-              <thead class="text-slate-400">
-                <tr>
-                  <th class="px-3 py-2 text-left">Stream</th>
-                  <th class="px-3 py-2 text-left">Destino</th>
-                  <th class="px-3 py-2 text-left">Protocolo</th>
-                  <th class="px-3 py-2 text-left">Criada</th>
-                  <th class="px-3 py-2 text-left">⬆ Bytes</th>
-                  <th class="px-3 py-2 text-left">⬇ Bytes</th>
-                </tr>
-              </thead>
-              <tbody class="divide-y divide-slate-800">
-                {{range .Streams}}
-                <tr>
-                  <td class="px-3 py-2 font-mono text-xs">{{.StreamID}}</td>
-                  <td class="px-3 py-2 font-mono text-xs">{{.Target}}</td>
-                  <td class="px-3 py-2 uppercase">{{.Protocol}}</td>
-                  <td class="px-3 py-2 text-slate-300">{{since .CreatedAt}}</td>
-                  <td class="px-3 py-2 text-slate-300">{{humanBytes .BytesUp}}</td>
-                  <td class="px-3 py-2 text-slate-300">{{humanBytes .BytesDown}}</td>
-                </tr>
-                {{end}}
-              </tbody>
-            </table>
-          </div>
-          {{else}}
-          <div class="text-sm text-slate-400">Nenhum fluxo ativo</div>
-          {{end}}
-        </div>
-        {{end}}
-      </div>
-      {{else}}
-      <div class="rounded-xl border border-dashed border-slate-800 bg-slate-900/40 p-6 text-center text-slate-400">
-        Nenhum agente conectado.
-      </div>
-      {{end}}
-    </section>
-  </div>
-</body>
-</html>`
 
 func (s *relayServer) validateAgent(agentID, token string) bool {
 	expected, ok := s.agentTokens[agentID]
