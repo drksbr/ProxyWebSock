@@ -18,7 +18,6 @@ import (
 
 	"github.com/drksbr/ProxyWebSock/internal/protocol"
 	"github.com/drksbr/ProxyWebSock/internal/runtime"
-	"github.com/drksbr/ProxyWebSock/internal/util"
 	"github.com/drksbr/ProxyWebSock/internal/version"
 )
 
@@ -61,8 +60,10 @@ func NewCommand(globals *runtime.Options) *cobra.Command {
 				return err
 			}
 			opts.logger = globals.Logger().With("component", "agent")
-			ctx, cancel := util.WithSignalContext(context.Background())
-			defer cancel()
+			ctx := cmd.Context()
+			if ctx == nil {
+				ctx = context.Background()
+			}
 			return opts.run(ctx)
 		},
 	}

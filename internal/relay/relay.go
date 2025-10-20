@@ -34,7 +34,6 @@ import (
 
 	"github.com/drksbr/ProxyWebSock/internal/protocol"
 	"github.com/drksbr/ProxyWebSock/internal/runtime"
-	"github.com/drksbr/ProxyWebSock/internal/util"
 )
 
 type relayOptions struct {
@@ -79,9 +78,10 @@ func NewCommand(globals *runtime.Options) *cobra.Command {
 					return err
 				}
 			}
-			ctx, cancel := util.WithSignalContext(context.Background())
-			defer cancel()
-
+			ctx := cmd.Context()
+			if ctx == nil {
+				ctx = context.Background()
+			}
 			server, err := newRelayServer(globals.Logger().With("component", "relay"), opts)
 			if err != nil {
 				return err

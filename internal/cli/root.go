@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/spf13/cobra"
@@ -8,6 +9,7 @@ import (
 	"github.com/drksbr/ProxyWebSock/internal/agent"
 	"github.com/drksbr/ProxyWebSock/internal/relay"
 	"github.com/drksbr/ProxyWebSock/internal/runtime"
+	"github.com/drksbr/ProxyWebSock/internal/util"
 	"github.com/drksbr/ProxyWebSock/internal/version"
 )
 
@@ -15,8 +17,12 @@ func Execute() error {
 	opts := &runtime.Options{
 		LogLevel: "info",
 	}
+	rootCtx, cancel := util.WithSignalContext(context.Background())
+	defer cancel()
+
 	cmd := newRootCommand(opts)
-	return cmd.Execute()
+	cmd.SetContext(rootCtx)
+	return cmd.ExecuteContext(rootCtx)
 }
 
 func newRootCommand(opts *runtime.Options) *cobra.Command {
