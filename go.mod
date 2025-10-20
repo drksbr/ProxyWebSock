@@ -1,4 +1,4 @@
-module github.com/isaacramon/ProxyWebSock
+module github.com/drksbr/ProxyWebSock
 
 go 1.22.0
 
