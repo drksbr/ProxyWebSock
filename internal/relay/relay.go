@@ -300,7 +300,8 @@ func (s *relayServer) run(ctx context.Context) error {
 	if s.staticFS != nil {
 		fileServer := http.FileServer(http.FS(s.staticFS))
 		secureMux.Handle("/assets/", fileServer)
-		secureMux.Handle("/vite.svg", fileServer)
+		secureMux.Handle("/logo.svg", fileServer)
+		secureMux.Handle("/logo-white.svg", fileServer)
 	}
 	secureMux.Handle("/", http.HandlerFunc(s.handleStatus))
 
