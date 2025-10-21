@@ -41,6 +41,10 @@ $(WEB_NODE_MODULES):
 	@echo "Installing web dependencies with $(PM)..."
 	@cd $(WEB_DIR) && $(WEB_INSTALL_CMD)
 
+update:	
+	@echo "Updating project from git..."
+	@git pull origin main
+
 mkln:
 	@rm -rf $(WEB_DIR)/dist
 	@ln -sfn $(CURDIR)/internal/relay/dist $(WEB_DIR)/dist
