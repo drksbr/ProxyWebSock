@@ -3,8 +3,6 @@ package protocol
 import (
 	"encoding/base64"
 	"fmt"
-
-	"github.com/google/uuid"
 )
 
 type FrameType string
@@ -31,7 +29,7 @@ type Frame struct {
 func EncodePayload(data []byte) string {
 	if len(data) == 0 {
 		return ""
-}
+	}
 	return base64.StdEncoding.EncodeToString(data)
 }
 
@@ -47,21 +45,28 @@ func DecodePayload(encoded string) ([]byte, error) {
 }
 
 func EncodeBinaryFrame(streamID string, payload []byte) ([]byte, error) {
-	u, err := uuid.Parse(streamID)
-	if err != nil {
-		return nil, fmt.Errorf("invalid stream id %q: %w", streamID, err)
+	idLen := len(streamID)
+	if idLen == 0 || idLen > 255 {
+		return nil, fmt.Errorf("invalid stream id length %d", idLen)
 	}
-	buf := make([]byte, 16+len(payload))
-	copy(buf[:16], u[:])
-	copy(buf[16:], payload)
+	buf := make([]byte, 1+idLen+len(payload))
+	buf[0] = byte(idLen)
+	copy(buf[1:1+idLen], streamID)
+	copy(buf[1+idLen:], payload)
 	return buf, nil
 }
 
 func DecodeBinaryFrame(data []byte) (string, []byte, error) {
-	if len(data) < 16 {
-		return "", nil, fmt.Errorf("binary frame too short: %d", len(data))
+	if len(data) < 1 {
+		return "", nil, fmt.Errorf("binary frame missing stream id length")
 	}
-	var u uuid.UUID
-	copy(u[:], data[:16])
-	return u.String(), data[16:], nil
+	idLen := int(data[0])
+	if idLen == 0 {
+		return "", nil, fmt.Errorf("binary frame has zero-length stream id")
+	}
+	if len(data) < 1+idLen {
+		return "", nil, fmt.Errorf("binary frame too short for stream id: have %d need %d", len(data), 1+idLen)
+	}
+	streamID := string(data[1 : 1+idLen])
+	return streamID, data[1+idLen:], nil
 }

@@ -5,6 +5,11 @@ WEB_NODE_MODULES := $(WEB_DIR)/node_modules
 GO_CMD := ./cmd/intratun
 BIN_DIR := bin
 BINARY := $(BIN_DIR)/intratun
+PID_FILE := $(BIN_DIR)/intratun.pid
+LOG_FILE := $(BIN_DIR)/intratun.log
+
+RELAY_ARGS := relay --proxy-listen=:8080 --secure-listen=:443 --socks-listen=:1080 --agents=myagent:supersecret --acl-allow='^.*:443$$' --acme-host=relay.neurocirurgiahgrs.com.br --acme-email=admin@ncr.com.br --acme-cache=/var/lib/intratun/acme --acme-http=:80
+AGENT_ARGS := agent --relay=wss://relay.neurocirurgiahgrs.com.br/tunnel --id=myagent --token=supersecret --dial-timeout-ms=5000 --max-frame=32768 --read-buf=65536 --write-buf=65536
 
 PM ?= bun
 
@@ -28,7 +33,7 @@ else
   $(error Unsupported package manager "$(PM)". Set PM=bun|npm|pnpm|yarn)
 endif
 
-.PHONY: all build web-install web-build go-build clean web-dev run docker-build docker-run compose-up compose-down
+.PHONY: all build web-install web-build go-build clean web-dev run run-relay run-agent relay-start relay-stop relay-restart docker-build docker-run compose-up compose-down
 
 all: build
 
@@ -50,10 +55,47 @@ go-build: web-build
 build: go-build
 
 run-relay: 
-	$(BINARY) relay --proxy-listen=:8080 --secure-listen=:443 --socks-listen=:1080 --agents=myagent:supersecret --acl-allow='^.*:443$$' --acme-host=relay.neurocirurgiahgrs.com.br --acme-email=admin@ncr.com.br --acme-cache=/var/lib/intratun/acme --acme-http=:80
+	$(BINARY) $(RELAY_ARGS)
 
 run-agent: 
-	$(BINARY) agent --relay=wss://relay.neurocirurgiahgrs.com.br/tunnel --id=myagent --token=supersecret --dial-timeout-ms=5000 --max-frame=32768 --read-buf=65536 --write-buf=65536
+	$(BINARY) $(AGENT_ARGS)
+
+relay-start: go-build
+	@if [ -f $(PID_FILE) ]; then \
+		echo "PID file $(PID_FILE) already exists. Is the relay running?"; \
+		exit 1; \
+	fi
+	@echo "Starting relay daemon..."
+	@nohup $(BINARY) $(RELAY_ARGS) --pid-file=$(PID_FILE) >> $(LOG_FILE) 2>&1 &
+	@sleep 1
+	@if [ ! -f $(PID_FILE) ]; then \
+		echo "Failed to create PID file at $(PID_FILE). Check $(LOG_FILE) for details."; \
+		exit 1; \
+	fi
+	@echo "Relay running with PID $$(cat $(PID_FILE))"
+
+relay-stop:
+	@if [ ! -f $(PID_FILE) ]; then \
+		echo "PID file $(PID_FILE) not found. Relay not running?"; \
+		exit 0; \
+	fi
+	@PID=$$(cat $(PID_FILE)); \
+	if [ -z "$$PID" ]; then \
+		echo "PID file empty. Removing stale file."; \
+		rm -f $(PID_FILE); \
+		exit 0; \
+	fi; \
+	if kill -0 $$PID 2>/dev/null; then \
+		echo "Stopping relay (PID $$PID)..."; \
+		kill $$PID; \
+	else \
+		echo "Relay process $$PID not running. Cleaning up stale PID file."; \
+	fi
+	@rm -f $(PID_FILE)
+
+relay-restart:
+	@$(MAKE) relay-stop
+	@$(MAKE) relay-start
 
 web-dev:
 	@cd $(WEB_DIR) && $(WEB_DEV_CMD)

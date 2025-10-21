@@ -19,6 +19,7 @@ func Execute() error {
 	}
 	rootCtx, cancel := util.WithSignalContext(context.Background())
 	defer cancel()
+	defer opts.Cleanup()
 
 	cmd := newRootCommand(opts)
 	cmd.SetContext(rootCtx)
@@ -31,12 +32,16 @@ func newRootCommand(opts *runtime.Options) *cobra.Command {
 		Short:        "HTTP CONNECT proxy over WebSocket reverse tunnel",
 		SilenceUsage: true,
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-			return opts.SetupLogger()
+			if err := opts.SetupLogger(); err != nil {
+				return err
+			}
+			return opts.SetupPIDFile()
 		},
 	}
 
 	cmd.PersistentFlags().BoolVar(&opts.JSONLogs, "json-logs", false, "emit logs in JSON format")
 	cmd.PersistentFlags().StringVar(&opts.LogLevel, "log-level", opts.LogLevel, "log level (debug, info, warn, error)")
+	cmd.PersistentFlags().StringVar(&opts.PIDFile, "pid-file", "", "write PID to file and remove it on exit")
 
 	cmd.AddCommand(relay.NewCommand(opts))
 	cmd.AddCommand(agent.NewCommand(opts))

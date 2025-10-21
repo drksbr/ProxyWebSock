@@ -65,9 +65,6 @@ type MetricsSnapshot = {
   timestamp: number
 }
 
-const POLL_INTERVAL_MS = 3000
-const POLL_INTERVAL_SECONDS = POLL_INTERVAL_MS / 1000
-
 const RANGE_OPTIONS = [
   { label: '10m', minutes: 10 },
   { label: '30m', minutes: 30 },
@@ -77,6 +74,15 @@ const RANGE_OPTIONS = [
   { label: '7d', minutes: 10080 },
 ] as const
 
+const REFRESH_OPTIONS = [
+  { label: '0.5s', ms: 500 },
+  { label: '1s', ms: 1000 },
+  { label: '2s', ms: 2000 },
+  { label: '3s', ms: 3000 },
+  { label: '5s', ms: 5000 },
+  { label: '10s', ms: 10000 },
+] as const
+
 type NetworkPoint = {
   timestamp: number
   inbound: number
@@ -84,8 +90,6 @@ type NetworkPoint = {
 }
 
 const MAX_HISTORY_MINUTES = Math.max(...RANGE_OPTIONS.map((option) => option.minutes))
-const MAX_NETWORK_POINTS =
-  Math.ceil((MAX_HISTORY_MINUTES * 60) / POLL_INTERVAL_SECONDS) + 10
 
 const emptyPoint: ResourcePoint = {
   timestamp: '',
@@ -142,6 +146,20 @@ let cpuChart: Chart<'line'> | null = null
 let memChart: Chart<'line'> | null = null
 let networkChart: Chart<'line'> | null = null
 let pollTimer: number | null = null
+
+const refreshIntervalMs = ref<number>(3000)
+const refreshMenuOpen = ref(false)
+const maxNetworkPoints = computed(() =>
+  Math.ceil((MAX_HISTORY_MINUTES * 60 * 1000) / refreshIntervalMs.value) + 10,
+)
+const selectedRefreshLabel = computed(() => {
+  const match = REFRESH_OPTIONS.find((option) => option.ms === refreshIntervalMs.value)
+  if (match) {
+    return match.label
+  }
+  const seconds = refreshIntervalMs.value / 1000
+  return seconds < 1 ? `${seconds.toFixed(2)}s` : `${seconds.toFixed(1)}s`
+})
 
 const agentSearch = ref('')
 const connectionSearch = ref('')
@@ -264,8 +282,10 @@ function formatBytes(bytes?: number | null): string {
 
 function formatRate(bytesPerSecond?: number): string {
   const value = Number(bytesPerSecond ?? 0)
-  if (!value || value <= 0) return '0 B/s'
-  return `${formatBytes(value)}/s`
+  if (!value || value <= 0) return '0 Mb/s'
+  const megabits = (value * 8) / 1_000_000
+  const precision = megabits < 1 ? 2 : megabits < 10 ? 2 : megabits < 100 ? 1 : 0
+  return `${megabits.toFixed(precision)} Mb/s`
 }
 
 function formatCount(value: number | string): string {
@@ -332,7 +352,15 @@ function schedulePoll() {
     } finally {
       schedulePoll()
     }
-  }, POLL_INTERVAL_MS)
+  }, refreshIntervalMs.value)
+}
+
+function restartPolling() {
+  if (pollTimer) {
+    window.clearTimeout(pollTimer)
+    pollTimer = null
+  }
+  schedulePoll()
 }
 
 function sliceHistory(history: ResourcePoint[]): ResourcePoint[] {
@@ -429,7 +457,7 @@ function ensureCharts() {
         labels: [],
         datasets: [
           {
-            label: 'In (MiB/s)',
+            label: 'In (Mb/s)',
             data: [],
             borderColor: '#22d3ee',
             backgroundColor: 'rgba(34, 211, 238, 0.12)',
@@ -438,7 +466,7 @@ function ensureCharts() {
             pointRadius: 0,
           },
           {
-            label: 'Out (MiB/s)',
+            label: 'Out (Mb/s)',
             data: [],
             borderColor: '#c084fc',
             backgroundColor: 'rgba(192, 132, 252, 0.12)',
@@ -516,8 +544,8 @@ function updateCharts(data: StatusPayload) {
     netLabels.push(
       formatChartTimestamp(new Date(point.timestamp).toISOString()),
     )
-    inboundValues.push(point.inbound / (1024 * 1024))
-    outboundValues.push(point.outbound / (1024 * 1024))
+    inboundValues.push((point.inbound * 8) / 1_000_000)
+    outboundValues.push((point.outbound * 8) / 1_000_000)
   })
 
   networkChart.data.labels = netLabels
@@ -556,7 +584,7 @@ function appendNetworkHistory(timestamp: number, rates: NetworkRates) {
     inbound: rates.in,
     outbound: rates.out,
   })
-  const overflow = state.netHistory.length - MAX_NETWORK_POINTS
+  const overflow = state.netHistory.length - maxNetworkPoints.value
   if (overflow > 0) {
     state.netHistory.splice(0, overflow)
   }
@@ -569,6 +597,10 @@ watch(connectionOptions, (options) => {
   ) {
     selectedConnectionCount.value = null
   }
+})
+
+watch(refreshIntervalMs, () => {
+  restartPolling()
 })
 
 watch(
@@ -652,6 +684,11 @@ function clearConnectionFilters() {
   selectedConnectionCount.value = null
   connectionSearch.value = ''
 }
+
+function selectRefreshInterval(ms: number) {
+  refreshIntervalMs.value = ms
+  refreshMenuOpen.value = false
+}
 </script>
 
 <template>
@@ -690,8 +727,38 @@ function clearConnectionFilters() {
       <section>
         <div class="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <h2 class="text-xl font-semibold">Resumo</h2>
-          <div class="text-sm text-slate-400">
-            Atualizado <span class="font-medium text-slate-200">{{ generatedAtLabel }}</span>
+          <div class="flex flex-col items-start gap-2 text-sm text-slate-400 sm:flex-row sm:items-center sm:gap-4">
+            <div>
+              Atualizado <span class="font-medium text-slate-200">{{ generatedAtLabel }}</span>
+            </div>
+            <div class="relative">
+              <button
+                type="button"
+                class="flex items-center gap-2 rounded-full border border-slate-700 bg-slate-900/80 px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-slate-200 transition hover:border-slate-500 hover:text-slate-100"
+                @click="refreshMenuOpen = !refreshMenuOpen"
+                @keydown.escape="refreshMenuOpen = false"
+              >
+                <span class="text-[11px] font-semibold text-slate-400">Atualizar a cada</span>
+                <span class="font-mono text-sm text-slate-100">{{ selectedRefreshLabel }}</span>
+                <span class="text-slate-500" :class="refreshMenuOpen ? 'rotate-180 transform transition' : 'transition'">▾</span>
+              </button>
+              <div
+                v-if="refreshMenuOpen"
+                class="absolute right-0 z-10 mt-2 w-40 overflow-hidden rounded-lg border border-slate-800 bg-slate-950/95 shadow-lg shadow-slate-950/40 backdrop-blur"
+              >
+                <button
+                  v-for="option in REFRESH_OPTIONS"
+                  :key="option.ms"
+                  type="button"
+                  class="flex w-full items-center justify-between px-3 py-2 text-left text-sm transition"
+                  :class="option.ms === refreshIntervalMs ? 'bg-sky-500/20 text-sky-100' : 'text-slate-200 hover:bg-slate-900/80'"
+                  @click="selectRefreshInterval(option.ms)"
+                >
+                  <span class="font-mono text-sm">{{ option.label }}</span>
+                  <span v-if="option.ms === refreshIntervalMs" class="text-xs text-sky-200">ativo</span>
+                </button>
+              </div>
+            </div>
           </div>
         </div>
         <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
@@ -737,7 +804,7 @@ function clearConnectionFilters() {
           <div class="rounded-lg border border-slate-800 bg-slate-900/60 p-4 lg:col-span-2">
             <div class="mb-2 flex items-center justify-between text-sm text-slate-400">
               <span>Tráfego de Rede</span>
-              <span class="font-mono text-xs text-slate-500">MiB/s</span>
+              <span class="font-mono text-xs text-slate-500">Mb/s</span>
             </div>
             <div class="h-48">
               <canvas ref="networkCanvas"></canvas>

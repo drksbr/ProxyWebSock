@@ -5,8 +5,8 @@ go 1.22.0
 toolchain go1.22.7
 
 require (
-	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
+	github.com/lucsky/cuid v1.0.1
 	github.com/prometheus/client_golang v1.20.4
 	github.com/shirou/gopsutil/v4 v4.24.5
 	github.com/spf13/cobra v1.10.1

@@ -27,8 +27,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/lucsky/cuid"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/acme/autocert"
@@ -446,7 +446,7 @@ func (s *relayServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	streamID := uuid.NewString()
+	streamID := cuid.New()
 	stream := newRelayStream(streamID, session, streamProtoHTTP, clientConn, buf, host, port)
 	if err := session.registerStream(stream); err != nil {
 		writeProxyError(buf, fmt.Sprintf("stream register failed: %v", err))
@@ -593,7 +593,7 @@ func (s *relayServer) handleSocksConn(conn net.Conn) {
 		return
 	}
 
-	streamID := uuid.NewString()
+	streamID := cuid.New()
 	stream := newRelayStream(streamID, session, streamProtoSOCKS5, conn, nil, host, port)
 	if err := session.registerStream(stream); err != nil {
 		logger.Warn("register stream failed", "stream", streamID, "error", err)
