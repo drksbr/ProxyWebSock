@@ -143,6 +143,11 @@ let memChart: Chart<'line'> | null = null
 let networkChart: Chart<'line'> | null = null
 let pollTimer: number | null = null
 
+const agentSearch = ref('')
+const connectionSearch = ref('')
+const selectedConnectionCount = ref<number | null>(null)
+const expandedAgents = ref<Set<string>>(new Set())
+
 const summaryCards = computed(() => {
   const metrics = state.data.metrics
   const resources = state.data.resources.current
@@ -160,7 +165,44 @@ const summaryCards = computed(() => {
   ]
 })
 
-const hasAgents = computed(() => state.data.agents.length > 0)
+const connectionOptions = computed(() => {
+  const counts = new Map<number, number>()
+  state.data.agents.forEach((agent) => {
+    const count = agent.streams?.length ?? 0
+    counts.set(count, (counts.get(count) ?? 0) + 1)
+  })
+  return Array.from(counts.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([count, total]) => ({
+      count,
+      total,
+      label: `${count} ${count === 1 ? 'conexão' : 'conexões'} (${total})`,
+    }))
+})
+
+const filteredConnectionOptions = computed(() => {
+  const query = connectionSearch.value.trim().toLowerCase()
+  if (!query) return connectionOptions.value
+  return connectionOptions.value.filter((option) =>
+    option.label.toLowerCase().includes(query),
+  )
+})
+
+const filteredAgents = computed(() => {
+  const query = agentSearch.value.trim().toLowerCase()
+  const requiredConnections = selectedConnectionCount.value
+  return state.data.agents.filter((agent) => {
+    const streamCount = agent.streams?.length ?? 0
+    if (requiredConnections !== null && streamCount !== requiredConnections) {
+      return false
+    }
+    if (!query) return true
+    const haystack = `${agent.id} ${agent.remote}`.toLowerCase()
+    return haystack.includes(query)
+  })
+})
+
+const hasAgents = computed(() => filteredAgents.value.length > 0)
 
 const generatedAtLabel = computed(() =>
   formatAbsolute(state.data.generatedAt),
@@ -520,6 +562,15 @@ function appendNetworkHistory(timestamp: number, rates: NetworkRates) {
   }
 }
 
+watch(connectionOptions, (options) => {
+  if (
+    selectedConnectionCount.value !== null &&
+    !options.some((option) => option.count === selectedConnectionCount.value)
+  ) {
+    selectedConnectionCount.value = null
+  }
+})
+
 watch(
   () => state.data,
   (data) => {
@@ -532,6 +583,21 @@ watch(
 watch(
   () => state.rangeMinutes,
   () => updateCharts(state.data),
+)
+
+watch(
+  () => state.data.agents.map((agent) => agent.id),
+  (ids) => {
+    const available = new Set(ids)
+    const current = expandedAgents.value
+    const next = new Set<string>()
+    current.forEach((id) => {
+      if (available.has(id)) {
+        next.add(id)
+      }
+    })
+    expandedAgents.value = next
+  },
 )
 
 onMounted(() => {
@@ -550,6 +616,42 @@ onBeforeUnmount(() => {
   memChart = null
   networkChart = null
 })
+
+function toggleAgent(agentId: string) {
+  const next = new Set(expandedAgents.value)
+  if (next.has(agentId)) {
+    next.delete(agentId)
+  } else {
+    next.add(agentId)
+  }
+  expandedAgents.value = next
+}
+
+function isExpanded(agentId: string) {
+  return expandedAgents.value.has(agentId)
+}
+
+function selectConnectionCount(count: number | null) {
+  if (selectedConnectionCount.value === count) {
+    selectedConnectionCount.value = null
+  } else {
+    selectedConnectionCount.value = count
+  }
+}
+
+function chipClass(active: boolean): string {
+  const base =
+    'rounded-full border px-3 py-1.5 text-sm font-medium transition-colors'
+  if (active) {
+    return `${base} border-sky-400 bg-sky-500/20 text-sky-100`
+  }
+  return `${base} border-slate-700 text-slate-300 hover:border-slate-500 hover:text-slate-100`
+}
+
+function clearConnectionFilters() {
+  selectedConnectionCount.value = null
+  connectionSearch.value = ''
+}
 </script>
 
 <template>
@@ -648,22 +750,100 @@ onBeforeUnmount(() => {
         <div class="mb-4 flex items-center justify-between">
           <h2 class="text-xl font-semibold">Agentes</h2>
           <div class="text-sm text-slate-400">
-            {{ state.data.agents.length }} conectados
+            {{ filteredAgents.length }} de {{ state.data.agents.length }} conectados
           </div>
         </div>
-        <div v-if="hasAgents" class="space-y-6">
+        <div class="grid gap-4 rounded-xl border border-slate-800 bg-slate-900/40 p-4">
+          <div class="grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">
+            <label class="flex flex-col gap-2 text-sm font-medium text-slate-300">
+              Buscar agente
+              <input
+                v-model="agentSearch"
+                type="search"
+                placeholder="ID ou endereço remoto"
+                class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-sky-400 focus:outline-none focus:ring-1 focus:ring-sky-400"
+              >
+            </label>
+            <div class="flex flex-col gap-2">
+              <div class="flex items-center justify-between text-sm font-medium text-slate-300">
+                <span>Filtrar por conexões</span>
+                <button
+                  v-if="selectedConnectionCount !== null || connectionSearch"
+                  type="button"
+                  class="text-xs font-semibold uppercase tracking-wide text-slate-400 hover:text-slate-200"
+                  @click="clearConnectionFilters"
+                >
+                  Limpar
+                </button>
+              </div>
+              <input
+                v-model="connectionSearch"
+                type="search"
+                placeholder="Buscar quantidade, ex: 2"
+                class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-sky-400 focus:outline-none focus:ring-1 focus:ring-sky-400"
+              >
+              <div class="flex flex-wrap gap-2">
+                <button
+                  v-for="option in filteredConnectionOptions"
+                  :key="option.count"
+                  type="button"
+                  :class="chipClass(selectedConnectionCount === option.count)"
+                  @click="selectConnectionCount(option.count)"
+                >
+                  {{ option.label }}
+                </button>
+                <p v-if="!filteredConnectionOptions.length" class="text-xs text-slate-500">
+                  Nenhuma quantidade correspondente.
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div v-if="hasAgents" class="space-y-4">
           <article
-            v-for="agent in state.data.agents"
+            v-for="agent in filteredAgents"
             :key="agent.id"
-            class="rounded-xl border border-slate-800 bg-slate-900/60 p-5 shadow-lg shadow-slate-950/40"
+            class="overflow-hidden rounded-xl border border-slate-800 bg-slate-900/60 shadow-lg shadow-slate-950/40"
           >
-            <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+            <button
+              type="button"
+              class="flex w-full items-start justify-between gap-4 border-b border-slate-800 bg-slate-900/70 px-5 py-4 text-left transition hover:bg-slate-900/90"
+              @click="toggleAgent(agent.id)"
+            >
               <div class="space-y-1">
-                <div class="text-lg font-semibold">{{ agent.id }}</div>
+                <div class="text-lg font-semibold text-slate-100">{{ agent.id }}</div>
                 <div class="text-sm text-slate-400">
                   Remoto {{ agent.remote }} · Conectado há {{ formatRelative(agent.connectedAt) }}
                 </div>
-                <div v-if="agent.autoConfig" class="text-sm">
+              </div>
+              <div class="flex items-center gap-3">
+                <span class="rounded-full bg-slate-800/80 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-slate-300">
+                  {{ agent.streams?.length ?? 0 }} {{ (agent.streams?.length ?? 0) === 1 ? 'stream' : 'streams' }}
+                </span>
+                <span
+                  class="text-slate-500 transition-transform"
+                  :class="isExpanded(agent.id) ? 'rotate-90' : ''"
+                >
+                  ▶
+                </span>
+              </div>
+            </button>
+            <div v-if="isExpanded(agent.id)" class="space-y-4 px-5 py-4">
+              <div class="grid gap-2 text-sm text-slate-300 md:grid-cols-2">
+                <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
+                  <div class="text-xs uppercase tracking-wide text-slate-500">ID</div>
+                  <div class="font-mono text-sm text-slate-100">{{ agent.id }}</div>
+                </div>
+                <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
+                  <div class="text-xs uppercase tracking-wide text-slate-500">Remoto</div>
+                  <div class="font-mono text-sm text-slate-100 break-all">{{ agent.remote }}</div>
+                </div>
+                <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
+                  <div class="text-xs uppercase tracking-wide text-slate-500">Conectado</div>
+                  <div>{{ formatAbsolute(agent.connectedAt) }}</div>
+                </div>
+                <div v-if="agent.autoConfig" class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
+                  <div class="text-xs uppercase tracking-wide text-slate-500">Auto Config</div>
                   <a
                     :href="agent.autoConfig"
                     class="text-teal-400 transition hover:text-teal-200"
@@ -672,53 +852,50 @@ onBeforeUnmount(() => {
                   </a>
                 </div>
               </div>
-              <div class="text-sm text-slate-400 md:text-right">
-                {{ agent.streams?.length ?? 0 }} streams ativas
-              </div>
-            </div>
 
-            <div v-if="agent.streams?.length" class="mt-4 overflow-x-auto">
-              <table class="min-w-full divide-y divide-slate-800 text-sm">
-                <thead class="text-slate-400">
-                  <tr>
-                    <th class="px-3 py-2 text-left font-medium">Stream</th>
-                    <th class="px-3 py-2 text-left font-medium">Destino</th>
-                    <th class="px-3 py-2 text-left font-medium">Protocolo</th>
-                    <th class="px-3 py-2 text-left font-medium">Criada</th>
-                    <th class="px-3 py-2 text-left font-medium">⬆ Bytes</th>
-                    <th class="px-3 py-2 text-left font-medium">⬇ Bytes</th>
-                  </tr>
-                </thead>
-                <tbody class="divide-y divide-slate-800">
-                  <tr
-                    v-for="stream in agent.streams"
-                    :key="stream.streamId"
-                    class="hover:bg-slate-900/80"
-                  >
-                    <td class="px-3 py-2 font-mono text-xs text-slate-200">
-                      {{ stream.streamId }}
-                    </td>
-                    <td class="px-3 py-2 font-mono text-xs text-slate-300">
-                      {{ stream.target }}
-                    </td>
-                    <td class="px-3 py-2 uppercase text-slate-200">
-                      {{ stream.protocol }}
-                    </td>
-                    <td class="px-3 py-2 text-slate-300">
-                      {{ formatRelative(stream.createdAt) }}
-                    </td>
-                    <td class="px-3 py-2 text-slate-300">
-                      {{ formatBytes(stream.bytesUp) }}
-                    </td>
-                    <td class="px-3 py-2 text-slate-300">
-                      {{ formatBytes(stream.bytesDown) }}
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-            <div v-else class="mt-4 rounded-lg border border-dashed border-slate-800 bg-slate-900/80 p-4 text-sm text-slate-400">
-              Nenhum fluxo ativo
+              <div v-if="agent.streams?.length" class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-slate-800 text-sm">
+                  <thead class="text-slate-400">
+                    <tr>
+                      <th class="px-3 py-2 text-left font-medium">Stream</th>
+                      <th class="px-3 py-2 text-left font-medium">Destino</th>
+                      <th class="px-3 py-2 text-left font-medium">Protocolo</th>
+                      <th class="px-3 py-2 text-left font-medium">Criada</th>
+                      <th class="px-3 py-2 text-left font-medium">⬆ Bytes</th>
+                      <th class="px-3 py-2 text-left font-medium">⬇ Bytes</th>
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-slate-800">
+                    <tr
+                      v-for="stream in agent.streams"
+                      :key="stream.streamId"
+                      class="hover:bg-slate-900/80"
+                    >
+                      <td class="px-3 py-2 font-mono text-xs text-slate-200">
+                        {{ stream.streamId }}
+                      </td>
+                      <td class="px-3 py-2 font-mono text-xs text-slate-300">
+                        {{ stream.target }}
+                      </td>
+                      <td class="px-3 py-2 uppercase text-slate-200">
+                        {{ stream.protocol }}
+                      </td>
+                      <td class="px-3 py-2 text-slate-300">
+                        {{ formatRelative(stream.createdAt) }}
+                      </td>
+                      <td class="px-3 py-2 text-slate-300">
+                        {{ formatBytes(stream.bytesUp) }}
+                      </td>
+                      <td class="px-3 py-2 text-slate-300">
+                        {{ formatBytes(stream.bytesDown) }}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <div v-else class="rounded-lg border border-dashed border-slate-800 bg-slate-900/80 p-4 text-sm text-slate-400">
+                Nenhum fluxo ativo
+              </div>
             </div>
           </article>
         </div>
@@ -726,7 +903,7 @@ onBeforeUnmount(() => {
           v-else
           class="rounded-xl border border-dashed border-slate-800 bg-slate-900/40 p-6 text-center text-slate-400"
         >
-          Nenhum agente conectado.
+          Nenhum agente encontrado.
         </div>
       </section>
     </div>

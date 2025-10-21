@@ -49,8 +49,11 @@ go-build: web-build
 
 build: go-build
 
-run: web-build
-	@go run $(GO_CMD) relay
+run-relay: web-build go-build
+	./intratun relay   --proxy-listen=:80   --secure-listen=:443   --socks-listen=:1080   --agents=myagent:supersecret   --acl-allow='^.*:443$'   --acme-host=relay.neurocirurgiahgrs.com.br   --acme-email=admin@ncr.com.br   --acme-cache=/var/lib/intratun/acme   --acme-http=:80
+
+run-agent: go-build
+	./intratun agent   --server=relay.neurocirurgiahgrs.com.br:443   --agent-name=myagent   --agent-secret=supersecret 
 
 web-dev:
 	@cd $(WEB_DIR) && $(WEB_DEV_CMD)
