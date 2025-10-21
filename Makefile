@@ -41,6 +41,11 @@ $(WEB_NODE_MODULES):
 	@echo "Installing web dependencies with $(PM)..."
 	@cd $(WEB_DIR) && $(WEB_INSTALL_CMD)
 
+mkln:
+	@rm -rf $(WEB_DIR)/dist
+	@ln -sfn $(CURDIR)/internal/relay/dist $(WEB_DIR)/dist
+	@echo "Created symlink $(WEB_DIR)/dist -> $(CURDIR)/internal/relay/dist"
+
 web-install: $(WEB_NODE_MODULES)
 
 web-build: $(WEB_NODE_MODULES)
@@ -52,7 +57,7 @@ go-build: web-build
 	@mkdir -p $(BIN_DIR)
 	@go build -o $(BINARY) $(GO_CMD)
 
-build: go-build
+build: mkln go-build
 
 run-relay: 
 	$(BINARY) $(RELAY_ARGS)
