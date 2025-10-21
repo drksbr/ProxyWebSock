@@ -636,7 +636,8 @@ func (s *relayServer) collectStatus(r *http.Request) statusPayload {
 
 	resources := resourceSnapshot{}
 	if s.resources != nil {
-		resources = s.resources.snapshot()
+		const historyLimit = 512
+		resources = s.resources.snapshot(historyLimit)
 	}
 
 	return statusPayload{
@@ -1011,8 +1012,8 @@ func (s *relayAgentSession) performRegister() error {
 func (s *relayAgentSession) readLoop() {
 	defer s.conn.Close()
 	for {
-		var f protocol.Frame
-		if err := s.conn.ReadJSON(&f); err != nil {
+		messageType, r, err := s.conn.NextReader()
+		if err != nil {
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) || errors.Is(err, net.ErrClosed) {
 				s.server.logger.Info("agent disconnected", "agent", s.id)
 			} else {
@@ -1020,17 +1021,40 @@ func (s *relayAgentSession) readLoop() {
 			}
 			return
 		}
-		switch f.Type {
-		case protocol.FrameTypeDial:
-			s.handleDialAck(f)
-		case protocol.FrameTypeWrite:
-			s.handleWrite(f)
-		case protocol.FrameTypeClose:
-			s.handleClose(f)
-		case protocol.FrameTypeError:
-			s.handleError(f)
+
+		switch messageType {
+		case websocket.BinaryMessage:
+			data, err := io.ReadAll(r)
+			if err != nil {
+				s.server.logger.Warn("binary read failed", "agent", s.id, "error", err)
+				return
+			}
+			streamID, payload, err := protocol.DecodeBinaryFrame(data)
+			if err != nil {
+				s.server.logger.Warn("binary decode failed", "agent", s.id, "error", err)
+				continue
+			}
+			s.handleBinaryWrite(streamID, payload)
+		case websocket.TextMessage:
+			var f protocol.Frame
+			if err := json.NewDecoder(r).Decode(&f); err != nil {
+				s.server.logger.Warn("frame decode failed", "agent", s.id, "error", err)
+				return
+			}
+			switch f.Type {
+			case protocol.FrameTypeDial:
+				s.handleDialAck(f)
+			case protocol.FrameTypeWrite:
+				s.handleWrite(f)
+			case protocol.FrameTypeClose:
+				s.handleClose(f)
+			case protocol.FrameTypeError:
+				s.handleError(f)
+			default:
+				s.server.logger.Warn("unknown frame type", "agent", s.id, "type", f.Type)
+			}
 		default:
-			s.server.logger.Warn("unknown frame type", "agent", s.id, "type", f.Type)
+			// ignore other message types
 		}
 	}
 }
@@ -1054,17 +1078,26 @@ func (s *relayAgentSession) handleWrite(f protocol.Frame) {
 		s.server.logger.Debug("write for unknown stream", "agent", s.id, "stream", f.StreamID)
 		return
 	}
-	stream.markReady(nil)
 	payload, err := protocol.DecodePayload(f.Payload)
 	if err != nil {
 		s.server.logger.Warn("payload decode failed", "agent", s.id, "stream", f.StreamID, "error", err)
 		return
 	}
+	s.handleBinaryWrite(f.StreamID, payload)
+}
+
+func (s *relayAgentSession) handleBinaryWrite(streamID string, payload []byte) {
+	stream := s.lookupStream(streamID)
+	if stream == nil {
+		s.server.logger.Debug("write for unknown stream", "agent", s.id, "stream", streamID)
+		return
+	}
+	stream.markReady(nil)
 	if len(payload) == 0 {
 		return
 	}
 	if err := stream.writeToClient(payload); err != nil {
-		s.server.logger.Debug("client write failed", "agent", s.id, "stream", f.StreamID, "error", err)
+		s.server.logger.Debug("client write failed", "agent", s.id, "stream", streamID, "error", err)
 		return
 	}
 	s.server.metrics.bytesDownstream.Add(float64(len(payload)))
@@ -1119,7 +1152,31 @@ func (s *relayAgentSession) removeStream(streamID string) {
 func (s *relayAgentSession) send(f *protocol.Frame) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	return s.conn.WriteJSON(f)
+	if err := s.conn.SetWriteDeadline(time.Now().Add(20 * time.Second)); err != nil {
+		return err
+	}
+	err := s.conn.WriteJSON(f)
+	if err == nil {
+		err = s.conn.SetWriteDeadline(time.Time{})
+	}
+	return err
+}
+
+func (s *relayAgentSession) sendBinary(streamID string, payload []byte) error {
+	data, err := protocol.EncodeBinaryFrame(streamID, payload)
+	if err != nil {
+		return err
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.conn.SetWriteDeadline(time.Now().Add(20 * time.Second)); err != nil {
+		return err
+	}
+	err = s.conn.WriteMessage(websocket.BinaryMessage, data)
+	if err == nil {
+		err = s.conn.SetWriteDeadline(time.Time{})
+	}
+	return err
 }
 
 func (s *relayAgentSession) sendControl(messageType int) error {
@@ -1142,12 +1199,20 @@ func (s *relayAgentSession) close() {
 	if s.id != "" {
 		s.server.unregisterAgent(s.id)
 	}
+	var streams []*relayStream
 	s.streamsMu.Lock()
-	for id, stream := range s.streams {
-		stream.closeSilent(errSessionClosed)
-		delete(s.streams, id)
+	if len(s.streams) > 0 {
+		streams = make([]*relayStream, 0, len(s.streams))
+		for id, stream := range s.streams {
+			streams = append(streams, stream)
+			delete(s.streams, id)
+			s.server.metrics.activeStreams.Dec()
+		}
 	}
 	s.streamsMu.Unlock()
+	for _, stream := range streams {
+		stream.closeSilent(errSessionClosed)
+	}
 }
 
 func (s *relayAgentSession) snapshot() statusAgent {
@@ -1284,11 +1349,7 @@ func (s *relayStream) pipeClientOutbound() {
 		n, err := s.client.Read(buffer)
 		if n > 0 {
 			chunk := buffer[:n]
-			if err := s.agent.send(&protocol.Frame{
-				Type:     protocol.FrameTypeWrite,
-				StreamID: s.id,
-				Payload:  protocol.EncodePayload(chunk),
-			}); err != nil {
+			if err := s.agent.sendBinary(s.id, chunk); err != nil {
 				s.agent.server.logger.Debug("send to agent failed", "agent", s.agent.id, "stream", s.id, "error", err)
 				s.closeFromRelay(err)
 				return

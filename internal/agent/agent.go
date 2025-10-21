@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -273,25 +274,46 @@ func (s *session) register() error {
 
 func (s *session) readLoop() error {
 	for {
-		var f protocol.Frame
-		if err := s.conn.ReadJSON(&f); err != nil {
+		messageType, r, err := s.conn.NextReader()
+		if err != nil {
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
 			return err
 		}
 
-		switch f.Type {
-		case protocol.FrameTypeDial:
-			go s.handleDial(f)
-		case protocol.FrameTypeWrite:
-			s.handleWrite(f)
-		case protocol.FrameTypeClose:
-			s.handleClose(f)
-		case protocol.FrameTypeError:
-			s.handleRelayError(f)
+		switch messageType {
+		case websocket.BinaryMessage:
+			data, err := io.ReadAll(r)
+			if err != nil {
+				return err
+			}
+			streamID, payload, err := protocol.DecodeBinaryFrame(data)
+			if err != nil {
+				s.logger.Warn("binary decode failed", "error", err)
+				continue
+			}
+			s.handleBinaryWrite(streamID, payload)
+		case websocket.TextMessage:
+			var f protocol.Frame
+			if err := json.NewDecoder(r).Decode(&f); err != nil {
+				return err
+			}
+
+			switch f.Type {
+			case protocol.FrameTypeDial:
+				go s.handleDial(f)
+			case protocol.FrameTypeWrite:
+				s.handleWrite(f)
+			case protocol.FrameTypeClose:
+				s.handleClose(f)
+			case protocol.FrameTypeError:
+				s.handleRelayError(f)
+			default:
+				s.logger.Warn("unknown frame type", "type", f.Type)
+			}
 		default:
-			s.logger.Warn("unknown frame type", "type", f.Type)
+			// ignore other message types
 		}
 	}
 }
@@ -354,25 +376,7 @@ func (s *session) handleWrite(f protocol.Frame) {
 		s.logger.Warn("payload decode failed", "stream", f.StreamID, "error", err)
 		return
 	}
-	if len(payload) == 0 {
-		return
-	}
-
-	total := 0
-	for total < len(payload) {
-		n, err := stream.conn.Write(payload[total:])
-		if err != nil {
-			s.logger.Warn("stream write failed", "stream", f.StreamID, "error", err)
-			stream.close()
-			_ = s.sendFrame(&protocol.Frame{
-				Type:     protocol.FrameTypeError,
-				StreamID: f.StreamID,
-				Error:    err.Error(),
-			})
-			return
-		}
-		total += n
-	}
+	s.handleBinaryWrite(f.StreamID, payload)
 }
 
 func (s *session) handleClose(f protocol.Frame) {
@@ -396,6 +400,33 @@ func (s *session) handleRelayError(f protocol.Frame) {
 	}
 }
 
+func (s *session) handleBinaryWrite(streamID string, payload []byte) {
+	stream := s.getStream(streamID)
+	if stream == nil {
+		s.logger.Warn("write for unknown stream", "stream", streamID)
+		return
+	}
+	if len(payload) == 0 {
+		return
+	}
+
+	total := 0
+	for total < len(payload) {
+		n, err := stream.conn.Write(payload[total:])
+		if err != nil {
+			s.logger.Warn("stream write failed", "stream", streamID, "error", err)
+			stream.close()
+			_ = s.sendFrame(&protocol.Frame{
+				Type:     protocol.FrameTypeError,
+				StreamID: streamID,
+				Error:    err.Error(),
+			})
+			return
+		}
+		total += n
+	}
+}
+
 func (s *session) sendFrame(f *protocol.Frame) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -403,6 +434,23 @@ func (s *session) sendFrame(f *protocol.Frame) error {
 		return err
 	}
 	err := s.conn.WriteJSON(f)
+	if err == nil {
+		err = s.conn.SetWriteDeadline(time.Time{})
+	}
+	return err
+}
+
+func (s *session) sendBinary(streamID string, payload []byte) error {
+	data, err := protocol.EncodeBinaryFrame(streamID, payload)
+	if err != nil {
+		return err
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.conn.SetWriteDeadline(time.Now().Add(20 * time.Second)); err != nil {
+		return err
+	}
+	err = s.conn.WriteMessage(websocket.BinaryMessage, data)
 	if err == nil {
 		err = s.conn.SetWriteDeadline(time.Time{})
 	}
@@ -465,11 +513,7 @@ func (s *session) pipeOutbound(stream *agentStream) {
 		if n > 0 {
 			chunk := buf[:n]
 			stream.acquire(n)
-			errSend := s.sendFrame(&protocol.Frame{
-				Type:     protocol.FrameTypeWrite,
-				StreamID: stream.id,
-				Payload:  protocol.EncodePayload(chunk),
-			})
+			errSend := s.sendBinary(stream.id, chunk)
 			stream.release(n)
 			if errSend != nil {
 				s.logger.Warn("send payload failed", "stream", stream.id, "error", errSend)

@@ -93,14 +93,22 @@ func (r *resourceTracker) sample(ctx context.Context) {
 	r.mu.Unlock()
 }
 
-func (r *resourceTracker) snapshot() resourceSnapshot {
+func (r *resourceTracker) snapshot(limit int) resourceSnapshot {
 	if r == nil {
 		return resourceSnapshot{}
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	history := make([]resourcePoint, len(r.samples))
-	copy(history, r.samples)
+
+	historyLen := len(r.samples)
+	if limit > 0 && historyLen > limit {
+		historyLen = limit
+	}
+	history := make([]resourcePoint, historyLen)
+	if historyLen > 0 {
+		copy(history, r.samples[len(r.samples)-historyLen:])
+	}
+
 	return resourceSnapshot{
 		Current: r.current,
 		History: history,
