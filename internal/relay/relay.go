@@ -38,7 +38,7 @@ import (
 	"github.com/drksbr/ProxyWebSock/internal/runtime"
 )
 
-//go:embed dist/index.html dist/assets/* dist/vite.svg
+//go:embed dist/*
 var embeddedDashboard embed.FS
 
 type relayOptions struct {
