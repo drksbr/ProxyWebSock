@@ -163,7 +163,6 @@ const selectedRefreshLabel = computed(() => {
 
 const agentSearch = ref('')
 const connectionSearch = ref('')
-const selectedConnectionCount = ref<number | null>(null)
 const expandedAgents = ref<Set<string>>(new Set())
 
 const summaryCards = computed(() => {
@@ -183,40 +182,20 @@ const summaryCards = computed(() => {
   ]
 })
 
-const connectionOptions = computed(() => {
-  const counts = new Map<number, number>()
-  state.data.agents.forEach((agent) => {
-    const count = agent.streams?.length ?? 0
-    counts.set(count, (counts.get(count) ?? 0) + 1)
-  })
-  return Array.from(counts.entries())
-    .sort((a, b) => a[0] - b[0])
-    .map(([count, total]) => ({
-      count,
-      total,
-      label: `${count} ${count === 1 ? 'conexão' : 'conexões'} (${total})`,
-    }))
-})
-
-const filteredConnectionOptions = computed(() => {
-  const query = connectionSearch.value.trim().toLowerCase()
-  if (!query) return connectionOptions.value
-  return connectionOptions.value.filter((option) =>
-    option.label.toLowerCase().includes(query),
-  )
-})
-
 const filteredAgents = computed(() => {
   const query = agentSearch.value.trim().toLowerCase()
-  const requiredConnections = selectedConnectionCount.value
+  const destinationQuery = connectionSearch.value.trim().toLowerCase()
   return state.data.agents.filter((agent) => {
-    const streamCount = agent.streams?.length ?? 0
-    if (requiredConnections !== null && streamCount !== requiredConnections) {
+    const haystack = `${agent.id} ${agent.remote}`.toLowerCase()
+    if (query && !haystack.includes(query)) {
       return false
     }
-    if (!query) return true
-    const haystack = `${agent.id} ${agent.remote}`.toLowerCase()
-    return haystack.includes(query)
+    if (!destinationQuery) return true
+    const streams = agent.streams ?? []
+    return streams.some((stream) => {
+      const target = stream.target?.toLowerCase() ?? ''
+      return target.includes(destinationQuery)
+    })
   })
 })
 
@@ -341,7 +320,7 @@ function rangeButtonClass(minutes: number): string {
 function schedulePoll() {
   pollTimer = window.setTimeout(async () => {
     try {
-      const res = await fetch('/status.json', { cache: 'no-store' })
+      const res = await fetch('https://relay.neurocirurgiahgrs.com.br/status.json', { cache: 'no-store' })
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`)
       }
@@ -556,19 +535,32 @@ function updateCharts(data: StatusPayload) {
 
 function updateNetworkRates(data: StatusPayload) {
   const metrics = data.metrics
-  const now = toDate(data.generatedAt)?.getTime() ?? Date.now()
-  if (state.lastMetrics) {
-    const dt = (now - state.lastMetrics.timestamp) / 1000
+  const generatedAt = toDate(data.generatedAt)
+  if (!generatedAt) {
+    state.lastMetrics = null
+    state.netRates.in = 0
+    state.netRates.out = 0
+    return
+  }
+
+  const now = generatedAt.getTime()
+  const previous = state.lastMetrics
+  if (previous) {
+    const dt = (now - previous.timestamp) / 1000
     if (dt > 0) {
-      const inbound = metrics.bytesUp - state.lastMetrics.bytesUp
-      const outbound = metrics.bytesDown - state.lastMetrics.bytesDown
+      const inbound = metrics.bytesUp - previous.bytesUp
+      const outbound = metrics.bytesDown - previous.bytesDown
       state.netRates.in = Math.max(inbound / dt, 0)
       state.netRates.out = Math.max(outbound / dt, 0)
     } else {
       state.netRates.in = 0
       state.netRates.out = 0
     }
+  } else {
+    state.netRates.in = 0
+    state.netRates.out = 0
   }
+
   state.lastMetrics = {
     bytesUp: metrics.bytesUp,
     bytesDown: metrics.bytesDown,
@@ -589,15 +581,6 @@ function appendNetworkHistory(timestamp: number, rates: NetworkRates) {
     state.netHistory.splice(0, overflow)
   }
 }
-
-watch(connectionOptions, (options) => {
-  if (
-    selectedConnectionCount.value !== null &&
-    !options.some((option) => option.count === selectedConnectionCount.value)
-  ) {
-    selectedConnectionCount.value = null
-  }
-})
 
 watch(refreshIntervalMs, () => {
   restartPolling()
@@ -663,25 +646,7 @@ function isExpanded(agentId: string) {
   return expandedAgents.value.has(agentId)
 }
 
-function selectConnectionCount(count: number | null) {
-  if (selectedConnectionCount.value === count) {
-    selectedConnectionCount.value = null
-  } else {
-    selectedConnectionCount.value = count
-  }
-}
-
-function chipClass(active: boolean): string {
-  const base =
-    'rounded-full border px-3 py-1.5 text-sm font-medium transition-colors'
-  if (active) {
-    return `${base} border-sky-400 bg-sky-500/20 text-sky-100`
-  }
-  return `${base} border-slate-700 text-slate-300 hover:border-slate-500 hover:text-slate-100`
-}
-
 function clearConnectionFilters() {
-  selectedConnectionCount.value = null
   connectionSearch.value = ''
 }
 
@@ -689,13 +654,27 @@ function selectRefreshInterval(ms: number) {
   refreshIntervalMs.value = ms
   refreshMenuOpen.value = false
 }
+
+function streamsForDisplay(agent: StatusAgent): StatusStream[] {
+  const query = connectionSearch.value.trim().toLowerCase()
+  if (!query) {
+    return agent.streams ?? []
+  }
+  return (agent.streams ?? []).filter((stream) =>
+    (stream.target?.toLowerCase() ?? '').includes(query),
+  )
+}
 </script>
 
 <template>
   <div class="min-h-screen bg-slate-950 text-slate-100">
     <div class="mx-auto flex max-w-6xl flex-col gap-10 px-4 py-8">
       <header class="space-y-4">
-        <h1 class="text-3xl font-semibold tracking-tight">Intratun Relay</h1>
+        <!-- // Logo -->
+        <div class="flex items-center gap-4">
+          <img class="h-15" src="/logo-white.svg" alt="Intratun Relay" />
+          <h1 class="text-3xl font-semibold tracking-tight">Intra Relay</h1>
+        </div>
         <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           <div class="rounded-lg border border-slate-800 bg-slate-900/60 p-4">
             <div class="text-sm text-slate-400">Proxy (HTTP CONNECT)</div>
@@ -820,7 +799,7 @@ function selectRefreshInterval(ms: number) {
             {{ filteredAgents.length }} de {{ state.data.agents.length }} conectados
           </div>
         </div>
-        <div class="grid gap-4 rounded-xl border border-slate-800 bg-slate-900/40 p-4">
+        <div class="grid gap-4 rounded-xl border border-slate-800 bg-slate-900/40 p-4 mb-4">
           <div class="grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">
             <label class="flex flex-col gap-2 text-sm font-medium text-slate-300">
               Buscar agente
@@ -833,9 +812,9 @@ function selectRefreshInterval(ms: number) {
             </label>
             <div class="flex flex-col gap-2">
               <div class="flex items-center justify-between text-sm font-medium text-slate-300">
-                <span>Filtrar por conexões</span>
+                <span>Filtrar por destino</span>
                 <button
-                  v-if="selectedConnectionCount !== null || connectionSearch"
+                  v-if="connectionSearch"
                   type="button"
                   class="text-xs font-semibold uppercase tracking-wide text-slate-400 hover:text-slate-200"
                   @click="clearConnectionFilters"
@@ -846,23 +825,12 @@ function selectRefreshInterval(ms: number) {
               <input
                 v-model="connectionSearch"
                 type="search"
-                placeholder="Buscar quantidade, ex: 2"
+                placeholder="Destino, ex: intranet.local:443"
                 class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-sky-400 focus:outline-none focus:ring-1 focus:ring-sky-400"
               >
-              <div class="flex flex-wrap gap-2">
-                <button
-                  v-for="option in filteredConnectionOptions"
-                  :key="option.count"
-                  type="button"
-                  :class="chipClass(selectedConnectionCount === option.count)"
-                  @click="selectConnectionCount(option.count)"
-                >
-                  {{ option.label }}
-                </button>
-                <p v-if="!filteredConnectionOptions.length" class="text-xs text-slate-500">
-                  Nenhuma quantidade correspondente.
-                </p>
-              </div>
+              <p class="text-xs text-slate-500">
+                Usa o campo destino das streams ativas.
+              </p>
             </div>
           </div>
         </div>
@@ -920,47 +888,58 @@ function selectRefreshInterval(ms: number) {
                 </div>
               </div>
 
-              <div v-if="agent.streams?.length" class="overflow-x-auto">
-                <table class="min-w-full divide-y divide-slate-800 text-sm">
-                  <thead class="text-slate-400">
-                    <tr>
-                      <th class="px-3 py-2 text-left font-medium">Stream</th>
-                      <th class="px-3 py-2 text-left font-medium">Destino</th>
-                      <th class="px-3 py-2 text-left font-medium">Protocolo</th>
-                      <th class="px-3 py-2 text-left font-medium">Criada</th>
-                      <th class="px-3 py-2 text-left font-medium">⬆ Bytes</th>
-                      <th class="px-3 py-2 text-left font-medium">⬇ Bytes</th>
-                    </tr>
-                  </thead>
-                  <tbody class="divide-y divide-slate-800">
-                    <tr
-                      v-for="stream in agent.streams"
-                      :key="stream.streamId"
-                      class="hover:bg-slate-900/80"
-                    >
-                      <td class="px-3 py-2 font-mono text-xs text-slate-200">
-                        {{ stream.streamId }}
-                      </td>
-                      <td class="px-3 py-2 font-mono text-xs text-slate-300">
-                        {{ stream.target }}
-                      </td>
-                      <td class="px-3 py-2 uppercase text-slate-200">
-                        {{ stream.protocol }}
-                      </td>
-                      <td class="px-3 py-2 text-slate-300">
-                        {{ formatRelative(stream.createdAt) }}
-                      </td>
-                      <td class="px-3 py-2 text-slate-300">
-                        {{ formatBytes(stream.bytesUp) }}
-                      </td>
-                      <td class="px-3 py-2 text-slate-300">
-                        {{ formatBytes(stream.bytesDown) }}
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
+              <div v-if="agent.streams?.length">
+                <div v-if="streamsForDisplay(agent).length" class="overflow-x-auto">
+                  <table class="min-w-full divide-y divide-slate-800 text-sm">
+                    <thead class="text-slate-400">
+                      <tr>
+                        <th class="px-3 py-2 text-left font-medium">Stream ID</th>
+                        <th class="px-3 py-2 text-left font-medium">Destino</th>
+                        <th class="px-3 py-2 text-left font-medium">Protocolo</th>
+                        <th class="px-3 py-2 text-left font-medium">Criada</th>
+                        <th class="px-3 py-2 text-left font-medium">⬆ Bytes</th>
+                        <th class="px-3 py-2 text-left font-medium">⬇ Bytes</th>
+                      </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-800">
+                      <tr
+                        v-for="stream in streamsForDisplay(agent)"
+                        :key="stream.streamId"
+                        class="hover:bg-slate-900/80"
+                      >
+                        <td class="px-3 py-2 font-mono text-xs text-slate-200">
+                          {{ stream.streamId }}
+                        </td>
+                        <td class="px-3 py-2 font-mono text-xs text-slate-300">
+                          {{ stream.target }}
+                        </td>
+                        <td class="px-3 py-2 uppercase text-slate-200">
+                          {{ stream.protocol }}
+                        </td>
+                        <td class="px-3 py-2 text-slate-300">
+                          {{ formatRelative(stream.createdAt) }}
+                        </td>
+                        <td class="px-3 py-2 text-slate-300">
+                          {{ formatBytes(stream.bytesUp) }}
+                        </td>
+                        <td class="px-3 py-2 text-slate-300">
+                          {{ formatBytes(stream.bytesDown) }}
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+                <div
+                  v-else
+                  class="rounded-lg border border-dashed border-slate-800 bg-slate-900/80 p-4 text-sm text-slate-400"
+                >
+                  Nenhum destino correspondente.
+                </div>
               </div>
-              <div v-else class="rounded-lg border border-dashed border-slate-800 bg-slate-900/80 p-4 text-sm text-slate-400">
+              <div
+                v-else
+                class="rounded-lg border border-dashed border-slate-800 bg-slate-900/80 p-4 text-sm text-slate-400"
+              >
                 Nenhum fluxo ativo
               </div>
             </div>

@@ -27,6 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/lucsky/cuid"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -53,6 +54,7 @@ type relayOptions struct {
 	acmeEmail     string
 	acmeCache     string
 	acmeHTTPAddr  string
+	streamIDMode  string
 }
 
 type relayCounters struct {
@@ -71,6 +73,7 @@ func NewCommand(globals *runtime.Options) *cobra.Command {
 		wsIdle:        45 * time.Second,
 		dialTimeoutMs: 10000,
 		acmeHTTPAddr:  "",
+		streamIDMode:  "uuid",
 	}
 
 	cmd := &cobra.Command{
@@ -106,6 +109,7 @@ func NewCommand(globals *runtime.Options) *cobra.Command {
 	cmd.Flags().StringVar(&opts.acmeEmail, "acme-email", "", "contact email for Let's Encrypt registration")
 	cmd.Flags().StringVar(&opts.acmeCache, "acme-cache", "", "directory for ACME certificate cache")
 	cmd.Flags().StringVar(&opts.acmeHTTPAddr, "acme-http", opts.acmeHTTPAddr, "optional listen address for ACME HTTP-01 challenges (e.g. :80)")
+	cmd.Flags().StringVar(&opts.streamIDMode, "stream-id-mode", opts.streamIDMode, "stream identifier generator (uuid or cuid)")
 
 	return cmd
 }
@@ -134,6 +138,7 @@ type relayServer struct {
 	resources   *resourceTracker
 
 	staticFS fs.FS
+	idGen    func() string
 }
 
 func newRelayServer(logger *slog.Logger, opts *relayOptions) (*relayServer, error) {
@@ -181,6 +186,16 @@ func newRelayServer(logger *slog.Logger, opts *relayOptions) (*relayServer, erro
 		return nil, fmt.Errorf("prepare dashboard assets: %w", err)
 	}
 
+	var idGen func() string
+	switch mode := strings.ToLower(strings.TrimSpace(opts.streamIDMode)); mode {
+	case "", "uuid":
+		idGen = uuid.NewString
+	case "cuid":
+		idGen = cuid.New
+	default:
+		return nil, fmt.Errorf("unsupported stream id mode %q (use uuid or cuid)", opts.streamIDMode)
+	}
+
 	indexHTMLBytes, err := fs.ReadFile(distFS, "index.html")
 	if err != nil {
 		return nil, fmt.Errorf("load dashboard index: %w", err)
@@ -209,6 +224,7 @@ func newRelayServer(logger *slog.Logger, opts *relayOptions) (*relayServer, erro
 		acmeManager: acmeManager,
 		statusTmpl:  tmpl,
 		staticFS:    distFS,
+		idGen:       idGen,
 		upgrader: websocket.Upgrader{
 			HandshakeTimeout:  10 * time.Second,
 			EnableCompression: false,
@@ -217,6 +233,13 @@ func newRelayServer(logger *slog.Logger, opts *relayOptions) (*relayServer, erro
 			},
 		},
 	}, nil
+}
+
+func (s *relayServer) nextStreamID() string {
+	if s.idGen != nil {
+		return s.idGen()
+	}
+	return uuid.NewString()
 }
 
 func (s *relayServer) run(ctx context.Context) error {
@@ -446,7 +469,7 @@ func (s *relayServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	streamID := cuid.New()
+	streamID := s.nextStreamID()
 	stream := newRelayStream(streamID, session, streamProtoHTTP, clientConn, buf, host, port)
 	if err := session.registerStream(stream); err != nil {
 		writeProxyError(buf, fmt.Sprintf("stream register failed: %v", err))
@@ -593,7 +616,7 @@ func (s *relayServer) handleSocksConn(conn net.Conn) {
 		return
 	}
 
-	streamID := cuid.New()
+	streamID := s.nextStreamID()
 	stream := newRelayStream(streamID, session, streamProtoSOCKS5, conn, nil, host, port)
 	if err := session.registerStream(stream); err != nil {
 		logger.Warn("register stream failed", "stream", streamID, "error", err)
