@@ -8,8 +8,8 @@ BINARY := $(BIN_DIR)/intratun
 PID_FILE := $(BIN_DIR)/intratun.pid
 LOG_FILE := $(BIN_DIR)/intratun.log
 
-RELAY_ARGS := relay --proxy-listen=:8080 --secure-listen=:443 --socks-listen=:1080 --agents=Veloz-Alhandra:supersecret --acl-allow='^.*:443$$' --acme-host=relay.neurocirurgiahgrs.com.br --acme-email=admin@ncr.com.br --acme-cache=/var/lib/intratun/acme --acme-http=:80 --stream-id-mode=cuid
-AGENT_ARGS := agent --relay=wss://relay.neurocirurgiahgrs.com.br/tunnel --id=Veloz-Alhandra --token=supersecret --dial-timeout-ms=5000 --max-frame=32768 --read-buf=65536 --write-buf=65536 --stream-id-mode=cuid
+RELAY_ARGS := relay --stream-id-mode=cuid --proxy-listen=:8080 --secure-listen=:443 --socks-listen=:1080 --agents=Veloz-Alhandra:supersecret --acl-allow='^.*:443$$' --acme-host=relay.neurocirurgiahgrs.com.br --acme-email=admin@ncr.com.br --acme-cache=/var/lib/intratun/acme --acme-http=:80
+AGENT_ARGS := agent --relay=wss://relay.neurocirurgiahgrs.com.br/tunnel --id=Veloz-Alhandra --token=supersecret --dial-timeout-ms=5000 --max-frame=32768 --read-buf=65536 --write-buf=65536
 
 PM ?= bun
 
