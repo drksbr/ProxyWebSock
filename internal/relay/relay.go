@@ -5,7 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
-	_ "embed"
+	"embed"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -35,6 +36,9 @@ import (
 	"github.com/drksbr/ProxyWebSock/internal/protocol"
 	"github.com/drksbr/ProxyWebSock/internal/runtime"
 )
+
+//go:embed dist/index.html dist/assets/* dist/vite.svg
+var embeddedDashboard embed.FS
 
 type relayOptions struct {
 	proxyListen   string
@@ -128,10 +132,9 @@ type relayServer struct {
 	socksLn     net.Listener
 	stats       relayCounters
 	resources   *resourceTracker
-}
 
-//go:embed dashboard.html
-var statusTemplateHTML string
+	staticFS fs.FS
+}
 
 func newRelayServer(logger *slog.Logger, opts *relayOptions) (*relayServer, error) {
 	agentTokens, err := parseAgentEntries(opts.agentEntries)
@@ -173,7 +176,25 @@ func newRelayServer(logger *slog.Logger, opts *relayOptions) (*relayServer, erro
 		acmeManager.Cache = autocert.DirCache(opts.acmeCache)
 	}
 
-	tmpl, err := template.New("status").Parse(statusTemplateHTML)
+	distFS, err := fs.Sub(embeddedDashboard, "dist")
+	if err != nil {
+		return nil, fmt.Errorf("prepare dashboard assets: %w", err)
+	}
+
+	indexHTMLBytes, err := fs.ReadFile(distFS, "index.html")
+	if err != nil {
+		return nil, fmt.Errorf("load dashboard index: %w", err)
+	}
+
+	const bootstrapScript = `<script id="status-bootstrap">window.STATUS_BOOTSTRAP = {{ .Bootstrap }};</script>`
+	indexTemplateSource := string(indexHTMLBytes)
+	if strings.Contains(indexTemplateSource, "</head>") {
+		indexTemplateSource = strings.Replace(indexTemplateSource, "</head>", bootstrapScript+"</head>", 1)
+	} else {
+		indexTemplateSource = bootstrapScript + indexTemplateSource
+	}
+
+	tmpl, err := template.New("status").Parse(indexTemplateSource)
 	if err != nil {
 		return nil, fmt.Errorf("parse status template: %w", err)
 	}
@@ -187,6 +208,7 @@ func newRelayServer(logger *slog.Logger, opts *relayOptions) (*relayServer, erro
 		resources:   resources,
 		acmeManager: acmeManager,
 		statusTmpl:  tmpl,
+		staticFS:    distFS,
 		upgrader: websocket.Upgrader{
 			HandshakeTimeout:  10 * time.Second,
 			EnableCompression: false,
@@ -252,6 +274,11 @@ func (s *relayServer) run(ctx context.Context) error {
 	secureMux.Handle("/tunnel", http.HandlerFunc(s.handleTunnel))
 	secureMux.Handle("/autoconfig/", http.HandlerFunc(s.handleAutoConfig))
 	secureMux.Handle("/status.json", http.HandlerFunc(s.handleStatusJSON))
+	if s.staticFS != nil {
+		fileServer := http.FileServer(http.FS(s.staticFS))
+		secureMux.Handle("/assets/", fileServer)
+		secureMux.Handle("/vite.svg", fileServer)
+	}
 	secureMux.Handle("/", http.HandlerFunc(s.handleStatus))
 
 	s.secureSrv = &http.Server{
@@ -636,7 +663,7 @@ func (s *relayServer) collectStatus(r *http.Request) statusPayload {
 
 	resources := resourceSnapshot{}
 	if s.resources != nil {
-		const historyLimit = 512
+		const historyLimit = 7 * 24 * 60
 		resources = s.resources.snapshot(historyLimit)
 	}
 
