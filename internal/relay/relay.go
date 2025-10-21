@@ -45,7 +45,7 @@ type relayOptions struct {
 	proxyListen   string
 	secureListen  string
 	socksListen   string
-	agentEntries  []string
+	agentConfig   string
 	aclPatterns   []string
 	maxFrame      int
 	wsIdle        time.Duration
@@ -100,7 +100,7 @@ func NewCommand(globals *runtime.Options) *cobra.Command {
 	cmd.Flags().StringVar(&opts.proxyListen, "proxy-listen", opts.proxyListen, "listen address for HTTP CONNECT proxy (plain HTTP)")
 	cmd.Flags().StringVar(&opts.secureListen, "secure-listen", opts.secureListen, "listen address for TLS endpoints (/tunnel, /, /metrics)")
 	cmd.Flags().StringVar(&opts.socksListen, "socks-listen", opts.socksListen, "optional listen address for SOCKS5 proxy (plain TCP)")
-	cmd.Flags().StringSliceVar(&opts.agentEntries, "agents", nil, "allowed agent credentials in the form agentId:token (repeatable)")
+	cmd.Flags().StringVar(&opts.agentConfig, "agent-config", "", "path to YAML file containing agent definitions")
 	cmd.Flags().StringSliceVar(&opts.aclPatterns, "acl-allow", nil, "regex ACLs for allowed host:port destinations (repeatable)")
 	cmd.Flags().IntVar(&opts.maxFrame, "max-frame", opts.maxFrame, "maximum payload size per frame in bytes")
 	cmd.Flags().DurationVar(&opts.wsIdle, "ws-idle", opts.wsIdle, "maximum idle time on agent websocket before disconnect")
@@ -115,11 +115,11 @@ func NewCommand(globals *runtime.Options) *cobra.Command {
 }
 
 type relayServer struct {
-	logger      *slog.Logger
-	opts        *relayOptions
-	metrics     *relayMetrics
-	agentTokens map[string]string
-	acl         []*regexp.Regexp
+	logger         *slog.Logger
+	opts           *relayOptions
+	metrics        *relayMetrics
+	agentDirectory map[string]*agentRecord
+	acl            []*regexp.Regexp
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -141,13 +141,25 @@ type relayServer struct {
 	idGen    func() string
 }
 
+type agentRecord struct {
+	Login          string
+	Password       string
+	Identification string
+	Location       string
+	ACL            []*regexp.Regexp
+	ACLPatterns    []string
+}
+
 func newRelayServer(logger *slog.Logger, opts *relayOptions) (*relayServer, error) {
-	agentTokens, err := parseAgentEntries(opts.agentEntries)
+	if strings.TrimSpace(opts.agentConfig) == "" {
+		return nil, errors.New("--agent-config is required")
+	}
+	agentDirectory, err := loadAgentConfig(opts.agentConfig)
 	if err != nil {
 		return nil, err
 	}
-	if len(agentTokens) == 0 {
-		return nil, errors.New("at least one --agents entry is required")
+	if len(agentDirectory) == 0 {
+		return nil, errors.New("agent configuration file must define at least one agent")
 	}
 
 	acl, err := compileACLs(opts.aclPatterns)
@@ -215,16 +227,16 @@ func newRelayServer(logger *slog.Logger, opts *relayOptions) (*relayServer, erro
 	}
 
 	return &relayServer{
-		logger:      logger.With("role", "relay"),
-		opts:        opts,
-		metrics:     metrics,
-		agentTokens: agentTokens,
-		acl:         acl,
-		resources:   resources,
-		acmeManager: acmeManager,
-		statusTmpl:  tmpl,
-		staticFS:    distFS,
-		idGen:       idGen,
+		logger:         logger.With("role", "relay"),
+		opts:           opts,
+		metrics:        metrics,
+		agentDirectory: agentDirectory,
+		acl:            acl,
+		resources:      resources,
+		acmeManager:    acmeManager,
+		statusTmpl:     tmpl,
+		staticFS:       distFS,
+		idGen:          idGen,
 		upgrader: websocket.Upgrader{
 			HandshakeTimeout:  10 * time.Second,
 			EnableCompression: false,
@@ -435,7 +447,7 @@ func (s *relayServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.authorizeTarget(r.Host); err != nil {
+	if err := s.authorizeTarget(agentID, r.Host); err != nil {
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
@@ -604,7 +616,7 @@ func (s *relayServer) handleSocksConn(conn net.Conn) {
 		return
 	}
 	targetHostPort := net.JoinHostPort(host, strconv.Itoa(port))
-	if err := s.authorizeTarget(targetHostPort); err != nil {
+	if err := s.authorizeTarget(agentID, targetHostPort); err != nil {
 		logger.Warn("acl denied", "target", targetHostPort)
 		_ = writeSocksReply(conn, 0x02)
 		return
@@ -819,11 +831,14 @@ type statusMetrics struct {
 }
 
 type statusAgent struct {
-	ID          string         `json:"id"`
-	Remote      string         `json:"remote"`
-	ConnectedAt time.Time      `json:"connectedAt"`
-	Streams     []statusStream `json:"streams"`
-	AutoConfig  string         `json:"autoConfig"`
+	ID             string         `json:"id"`
+	Identification string         `json:"identification"`
+	Location       string         `json:"location"`
+	Remote         string         `json:"remote"`
+	ConnectedAt    time.Time      `json:"connectedAt"`
+	ACL            []string       `json:"acl"`
+	Streams        []statusStream `json:"streams"`
+	AutoConfig     string         `json:"autoConfig"`
 }
 
 type statusStream struct {
@@ -880,7 +895,7 @@ func generatePAC(agentID, token, socksHost, socksPort, proxyHost, proxyPort stri
 }
 
 func (s *relayServer) autoConfigURL(r *http.Request, agentID string) string {
-	token, ok := s.agentTokens[agentID]
+	record, ok := s.agentDirectory[agentID]
 	if !ok {
 		return ""
 	}
@@ -895,25 +910,39 @@ func (s *relayServer) autoConfigURL(r *http.Request, agentID string) string {
 	if host == "" {
 		return ""
 	}
-	return fmt.Sprintf("%s://%s/autoconfig/%s.pac?token=%s", scheme, host, url.PathEscape(agentID), url.QueryEscape(token))
+	return fmt.Sprintf("%s://%s/autoconfig/%s.pac?token=%s", scheme, host, url.PathEscape(agentID), url.QueryEscape(record.Password))
 }
 
 func (s *relayServer) validateAgent(agentID, token string) bool {
-	expected, ok := s.agentTokens[agentID]
-	if !ok {
-		return false
-	}
-	if len(expected) != len(token) {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(expected), []byte(token)) == 1
+	_, ok := s.authenticateAgent(agentID, token)
+	return ok
 }
 
-func (s *relayServer) authorizeTarget(hostport string) error {
-	if len(s.acl) == 0 {
+func (s *relayServer) authenticateAgent(agentID, token string) (*agentRecord, bool) {
+	record, ok := s.agentDirectory[agentID]
+	if !ok {
+		return nil, false
+	}
+	if len(record.Password) != len(token) {
+		return nil, false
+	}
+	if subtle.ConstantTimeCompare([]byte(record.Password), []byte(token)) != 1 {
+		return nil, false
+	}
+	return record, true
+}
+
+func (s *relayServer) authorizeTarget(agentID, hostport string) error {
+	var patterns []*regexp.Regexp
+	if record, ok := s.agentDirectory[agentID]; ok && len(record.ACL) > 0 {
+		patterns = record.ACL
+	} else {
+		patterns = s.acl
+	}
+	if len(patterns) == 0 {
 		return nil
 	}
-	for _, re := range s.acl {
+	for _, re := range patterns {
 		if re.MatchString(hostport) {
 			return nil
 		}
@@ -958,9 +987,13 @@ type relayAgentSession struct {
 	server *relayServer
 	conn   *websocket.Conn
 
-	id          string
-	remote      string
-	connectedAt time.Time
+	id             string
+	identification string
+	location       string
+	acl            []*regexp.Regexp
+	aclPatterns    []string
+	remote         string
+	connectedAt    time.Time
 
 	writeMu   sync.Mutex
 	streams   map[string]*relayStream
@@ -1038,10 +1071,17 @@ func (s *relayAgentSession) performRegister() error {
 	if f.AgentID == "" {
 		return errors.New("register missing agentId")
 	}
-	if !s.server.validateAgent(f.AgentID, f.Token) {
+	record, ok := s.server.authenticateAgent(f.AgentID, f.Token)
+	if !ok {
 		return errors.New("invalid credentials")
 	}
-	s.id = f.AgentID
+	s.id = record.Login
+	s.identification = record.Identification
+	s.location = record.Location
+	s.acl = record.ACL
+	if len(record.ACLPatterns) > 0 {
+		s.aclPatterns = append([]string(nil), record.ACLPatterns...)
+	}
 	if s.server.opts.wsIdle > 0 {
 		if err := s.conn.SetReadDeadline(time.Now().Add(s.server.opts.wsIdle)); err != nil {
 			return err
@@ -1268,9 +1308,14 @@ func (s *relayAgentSession) close() {
 
 func (s *relayAgentSession) snapshot() statusAgent {
 	agent := statusAgent{
-		ID:          s.id,
-		Remote:      s.remote,
-		ConnectedAt: s.connectedAt,
+		ID:             s.id,
+		Identification: s.identification,
+		Location:       s.location,
+		Remote:         s.remote,
+		ConnectedAt:    s.connectedAt,
+	}
+	if len(s.aclPatterns) > 0 {
+		agent.ACL = append(agent.ACL, s.aclPatterns...)
 	}
 	s.streamsMu.RLock()
 	if len(s.streams) > 0 {
@@ -1492,22 +1537,6 @@ func (s *relayStream) stats() statusStream {
 	}
 }
 
-func parseAgentEntries(entries []string) (map[string]string, error) {
-	result := make(map[string]string, len(entries))
-	for _, entry := range entries {
-		entry = strings.TrimSpace(entry)
-		if entry == "" {
-			continue
-		}
-		parts := strings.SplitN(entry, ":", 2)
-		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-			return nil, fmt.Errorf("invalid agent entry %q, expected agentId:token", entry)
-		}
-		result[parts[0]] = parts[1]
-	}
-	return result, nil
-}
-
 func compileACLs(patterns []string) ([]*regexp.Regexp, error) {
 	acls := make([]*regexp.Regexp, 0, len(patterns))
 	for _, pattern := range patterns {
@@ -1568,13 +1597,13 @@ func (s *relayServer) handleAutoConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	agentID := strings.TrimSuffix(path, ".pac")
-	expectedToken, ok := s.agentTokens[agentID]
+	record, ok := s.agentDirectory[agentID]
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
 	token := r.URL.Query().Get("token")
-	if subtle.ConstantTimeCompare([]byte(expectedToken), []byte(token)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(record.Password), []byte(token)) != 1 {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -1595,7 +1624,7 @@ func (s *relayServer) handleAutoConfig(w http.ResponseWriter, r *http.Request) {
 		proxyPort = "8080"
 	}
 
-	pac := generatePAC(agentID, expectedToken, host, socksPort, host, proxyPort)
+	pac := generatePAC(agentID, record.Password, host, socksPort, host, proxyPort)
 
 	w.Header().Set("Content-Type", "application/x-ns-proxy-autoconfig")
 	w.Header().Set("Cache-Control", "no-store")

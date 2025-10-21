@@ -1,0 +1,17 @@
+# Lista de agentes autorizados pelo relay.
+# Cada entrada descreve as credenciais e metadados para exibição no dashboard.
+agents:
+  - identification: "Veloz POP 01"
+    location: "Alhandra/PB, BR"
+    login: "agente01"
+    password: "troque-esta-senha"
+    acl_allow:
+      - "^.*:443$"
+      - "^intranet\\.empresa\\.lan:8443$"
+
+  - identification: "Veloz POP 02"
+    location: "Salvador/BA, BR"
+    login: "agente02"
+    password: "troque-esta-senha"
+    acl_allow:
+      - "^intranet\\.empresa\\.lan:443$"
