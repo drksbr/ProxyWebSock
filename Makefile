@@ -48,6 +48,7 @@ update:
 mkln:
 	@rm -rf $(WEB_DIR)/dist
 	@rm -rf $(CURDIR)/internal/relay/dist
+	@mkdir -p $(CURDIR)/internal/relay/dist
 	@ln -sfn $(CURDIR)/internal/relay/dist $(WEB_DIR)/dist
 	@echo "Created symlink $(WEB_DIR)/dist -> $(CURDIR)/internal/relay/dist"
 
