@@ -49,11 +49,11 @@ go-build: web-build
 
 build: go-build
 
-run-relay: web-build go-build
-	./intratun relay --proxy-listen=:8080 --secure-listen=:443 --socks-listen=:1080 --agents=myagent:supersecret --acl-allow='^.*:443$$' --acme-host=relay.neurocirurgiahgrs.com.br --acme-email=admin@ncr.com.br --acme-cache=/var/lib/intratun/acme --acme-http=:80
+run-relay: 
+	$(BINARY) relay --proxy-listen=:8080 --secure-listen=:443 --socks-listen=:1080 --agents=myagent:supersecret --acl-allow='^.*:443$$' --acme-host=relay.neurocirurgiahgrs.com.br --acme-email=admin@ncr.com.br --acme-cache=/var/lib/intratun/acme --acme-http=:80
 
-run-agent: go-build
-	./intratun agent --relay=wss://relay.neurocirurgiahgrs.com.br/tunnel --id=myagent --token=supersecret --dial-timeout-ms=5000 --max-frame=32768 --read-buf=65536 --write-buf=65536
+run-agent: 
+	$(BINARY) agent --relay=wss://relay.neurocirurgiahgrs.com.br/tunnel --id=myagent --token=supersecret --dial-timeout-ms=5000 --max-frame=32768 --read-buf=65536 --write-buf=65536
 
 web-dev:
 	@cd $(WEB_DIR) && $(WEB_DEV_CMD)
