@@ -68,8 +68,14 @@ build: mkln go-build
 run-relay: 
 	$(BINARY) $(RELAY_ARGS)
 
+run-relay-debug: 
+	$(BINARY) $(RELAY_ARGS) --log-level=debug
+
 run-agent: 
 	$(BINARY) $(AGENT_ARGS)
+
+run-agent-debug: 
+	$(BINARY) $(AGENT_ARGS) --log-level=debug
 
 relay-start: go-build
 	@if [ -f $(PID_FILE) ]; then \
