@@ -230,7 +230,7 @@ function normalizePayload(payload?: StatusPayload): StatusPayload {
 function schedulePoll() {
   pollTimer = window.setTimeout(async () => {
     try {
-      const res = await fetch("/status.json", { cache: "no-store" });
+      const res = await fetch("https://relay.neurocirurgiahgrs.com.br/status.json", { cache: "no-store" });
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`);
       }
@@ -313,28 +313,15 @@ function handleRangeUpdate(minutes: number) {
 <template>
   <div class="min-h-screen bg-slate-950 text-slate-100">
     <div class="mx-auto flex max-w-6xl flex-col gap-10 px-4 py-8">
-      <AppHeader
-        :proxy-addr="data.proxyAddr"
-        :secure-addr="data.secureAddr"
-        :socks-addr="data.socksAddr"
-        :acme-hosts="data.acmeHosts"
-      />
+      <AppHeader :proxy-addr="data.proxyAddr" :secure-addr="data.secureAddr" :socks-addr="data.socksAddr"
+        :acme-hosts="data.acmeHosts" />
 
-      <SummarySection
-        :generated-at="data.generatedAt"
-        :refresh-options="REFRESH_OPTIONS"
-        :selected-interval="refreshIntervalMs"
-        :summary-cards="summaryCards"
-        @update:refresh-interval="handleRefreshInterval"
-      />
+      <SummarySection :generated-at="data.generatedAt" :refresh-options="REFRESH_OPTIONS"
+        :selected-interval="refreshIntervalMs" :summary-cards="summaryCards"
+        @update:refresh-interval="handleRefreshInterval" />
 
-      <ResourcesSection
-        :resources="data.resources"
-        :range-options="RANGE_OPTIONS"
-        :selected-range="rangeMinutes"
-        :net-history="netHistory"
-        @update:range="handleRangeUpdate"
-      />
+      <ResourcesSection :resources="data.resources" :range-options="RANGE_OPTIONS" :selected-range="rangeMinutes"
+        :net-history="netHistory" @update:range="handleRangeUpdate" />
 
       <AgentsSection :agents="data.agents" />
     </div>

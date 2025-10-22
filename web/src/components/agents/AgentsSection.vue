@@ -134,44 +134,27 @@ function agentCardClasses(agent: StatusAgent): string {
       <div class="text-sm text-slate-400">
         {{ connectedAgentsCount }} ativos ·
         {{ agents.length }} cadastrados
-        <span v-if="degradedAgentsCount"
-          >· {{ degradedAgentsCount }} degradados</span
-        >
+        <span v-if="degradedAgentsCount">· {{ degradedAgentsCount }} degradados</span>
       </div>
     </div>
-    <div
-      class="grid gap-4 rounded-xl border border-slate-800 bg-slate-900/40 p-4 mb-4"
-    >
+    <div class="grid gap-4 rounded-xl border border-slate-800 bg-slate-900/40 p-4 mb-4">
       <div class="grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">
         <label class="flex flex-col gap-2 text-sm font-medium text-slate-300">
           Buscar agente
-          <input
-            v-model="agentSearch"
-            type="search"
-            placeholder="ID ou endereço remoto"
-            class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-sky-400 focus:outline-none focus:ring-1 focus:ring-sky-400"
-          />
+          <input v-model="agentSearch" type="search" placeholder="ID ou endereço remoto"
+            class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-sky-400 focus:outline-none focus:ring-1 focus:ring-sky-400" />
         </label>
         <div class="flex flex-col gap-2">
-          <div
-            class="flex items-center justify-between text-sm font-medium text-slate-300"
-          >
+          <div class="flex items-center justify-between text-sm font-medium text-slate-300">
             <span>Filtrar por destino</span>
-            <button
-              v-if="connectionSearch"
-              type="button"
+            <button v-if="connectionSearch" type="button"
               class="text-xs font-semibold uppercase tracking-wide text-slate-400 hover:text-slate-200"
-              @click="clearConnectionFilters"
-            >
+              @click="clearConnectionFilters">
               Limpar
             </button>
           </div>
-          <input
-            v-model="connectionSearch"
-            type="search"
-            placeholder="Destino, ex: intranet.local:443"
-            class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-sky-400 focus:outline-none focus:ring-1 focus:ring-sky-400"
-          />
+          <input v-model="connectionSearch" type="search" placeholder="Destino, ex: intranet.local:443"
+            class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-sky-400 focus:outline-none focus:ring-1 focus:ring-sky-400" />
           <p class="text-xs text-slate-500">
             Usa o campo destino das streams ativas.
           </p>
@@ -179,16 +162,10 @@ function agentCardClasses(agent: StatusAgent): string {
       </div>
     </div>
     <div v-if="hasAgents" class="space-y-4">
-      <article
-        v-for="agent in filteredAgents"
-        :key="agent.id"
-        :class="agentCardClasses(agent)"
-      >
-        <button
-          type="button"
+      <article v-for="agent in filteredAgents" :key="agent.id" :class="agentCardClasses(agent)">
+        <button type="button"
           class="flex w-full items-start justify-between gap-4 border-b border-slate-800 bg-slate-900/70 px-5 py-4 text-left transition hover:bg-slate-900/90"
-          @click="toggleAgent(agent.id)"
-        >
+          @click="toggleAgent(agent.id)">
           <div class="space-y-2">
             <div class="flex flex-wrap items-center gap-2">
               <div class="text-lg font-semibold text-slate-100">
@@ -206,9 +183,7 @@ function agentCardClasses(agent: StatusAgent): string {
               Remoto {{ agent.remote }}
             </div>
             <div class="text-xs text-slate-500">
-              <template
-                v-if="agent.status !== 'disconnected' && agent.connectedAt"
-              >
+              <template v-if="agent.status !== 'disconnected' && agent.connectedAt">
                 Conectado há {{ formatRelative(agent.connectedAt) }}
               </template>
               <template v-else-if="agent.lastHeartbeatAt">
@@ -219,37 +194,27 @@ function agentCardClasses(agent: StatusAgent): string {
           </div>
           <div class="flex flex-wrap items-center gap-3">
             <span
-              class="rounded-full bg-slate-800/80 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-slate-300"
-            >
+              class="rounded-full bg-slate-800/80 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-slate-300">
               {{ agent.streams?.length ?? 0 }}
               {{
                 (agent.streams?.length ?? 0) === 1 ? "stream" : "streams"
               }}
             </span>
-            <span
-              v-if="(agent.latencyMillis ?? 0) > 0"
-              class="rounded-full bg-slate-800/80 px-3 py-1 text-xs font-semibold text-slate-300"
-            >
+            <span v-if="(agent.latencyMillis ?? 0) > 0"
+              class="rounded-full bg-slate-800/80 px-3 py-1 text-xs font-semibold text-slate-300">
               RTT {{ formatMillis(agent.latencyMillis) }}
             </span>
-            <span
-              v-if="agent.heartbeatFailures"
-              class="rounded-full bg-amber-500/20 px-3 py-1 text-xs font-semibold text-amber-200"
-            >
+            <span v-if="agent.heartbeatFailures"
+              class="rounded-full bg-amber-500/20 px-3 py-1 text-xs font-semibold text-amber-200">
               {{ agent.heartbeatFailures }} HB falhos
             </span>
-            <span
-              class="text-slate-500 transition-transform"
-              :class="isExpanded(agent.id) ? 'rotate-90' : ''"
-            >
+            <span class="text-slate-500 transition-transform" :class="isExpanded(agent.id) ? 'rotate-90' : ''">
               ▶
             </span>
           </div>
         </button>
         <div v-if="isExpanded(agent.id)" class="space-y-4 px-5 py-4">
-          <div
-            class="grid gap-2 text-sm text-slate-300 md:grid-cols-2 lg:grid-cols-3"
-          >
+          <div class="grid gap-2 text-sm text-slate-300 md:grid-cols-2 lg:grid-cols-3">
             <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
               <div class="text-xs uppercase tracking-wide text-slate-500">
                 ID
@@ -299,20 +264,29 @@ function agentCardClasses(agent: StatusAgent): string {
                 Auto Config
               </div>
               <template v-if="agent.autoConfig">
-                <a
-                  :href="agent.autoConfig"
-                  class="text-teal-400 transition hover:text-teal-200"
-                >
+                <a :href="agent.autoConfig" class="text-teal-400 transition hover:text-teal-200">
                   Download PAC
                 </a>
               </template>
               <span v-else class="text-slate-500">Indisponível</span>
             </div>
+            <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3 lg:col-span-2">
+              <div class="text-xs uppercase tracking-wide text-slate-500">
+                Último erro
+              </div>
+              <div v-if="agent.lastError" class="space-y-1">
+                <div class="text-slate-200">{{ agent.lastError }}</div>
+                <div class="text-xs text-slate-500">
+                  {{ formatRelative(agent.lastErrorAt ?? "") }} ({{
+                    formatAbsolute(agent.lastErrorAt ?? "")
+                  }})
+                </div>
+              </div>
+              <div v-else class="text-slate-500">Nenhum</div>
+            </div>
           </div>
 
-          <div
-            class="grid gap-2 text-sm text-slate-300 md:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6"
-          >
+          <div class="grid gap-2 text-sm text-slate-300 md:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6">
             <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
               <div class="text-xs uppercase tracking-wide text-slate-500">
                 Último heartbeat
@@ -351,35 +325,13 @@ function agentCardClasses(agent: StatusAgent): string {
             </div>
             <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
               <div class="text-xs uppercase tracking-wide text-slate-500">
-                Falhas consecutivas
-              </div>
-              <div>{{ agent.heartbeatFailures ?? 0 }}</div>
-            </div>
-            <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
-              <div class="text-xs uppercase tracking-wide text-slate-500">
                 Erros acumulados
               </div>
               <div>{{ formatCount(agent.errorCount ?? 0) }}</div>
             </div>
-            <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
-              <div class="text-xs uppercase tracking-wide text-slate-500">
-                Último erro
-              </div>
-              <div v-if="agent.lastError" class="space-y-1">
-                <div class="text-slate-200">{{ agent.lastError }}</div>
-                <div class="text-xs text-slate-500">
-                  {{ formatRelative(agent.lastErrorAt ?? "") }} ({{
-                    formatAbsolute(agent.lastErrorAt ?? "")
-                  }})
-                </div>
-              </div>
-              <div v-else class="text-slate-500">Nenhum</div>
-            </div>
           </div>
 
-          <div
-            class="grid gap-2 text-sm text-slate-300 md:grid-cols-2 lg:grid-cols-4"
-          >
+          <div class="grid gap-2 text-sm text-slate-300 md:grid-cols-2 lg:grid-cols-4">
             <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
               <div class="text-xs uppercase tracking-wide text-slate-500">
                 Fila controle (relay)
@@ -406,9 +358,7 @@ function agentCardClasses(agent: StatusAgent): string {
             </div>
           </div>
 
-          <div
-            class="grid gap-2 text-sm text-slate-300 md:grid-cols-2 lg:grid-cols-3"
-          >
+          <div class="grid gap-2 text-sm text-slate-300 md:grid-cols-2 lg:grid-cols-3">
             <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
               <div class="text-xs uppercase tracking-wide text-slate-500">
                 CPU do agente
@@ -451,10 +401,7 @@ function agentCardClasses(agent: StatusAgent): string {
             <div class="text-xs uppercase tracking-wide text-slate-500">
               Destinos permitidos
             </div>
-            <div
-              v-if="agent.acl?.length"
-              class="mt-2 space-y-1 font-mono text-xs text-slate-200"
-            >
+            <div v-if="agent.acl?.length" class="mt-2 space-y-1 font-mono text-xs text-slate-200">
               <div v-for="pattern in agent.acl" :key="pattern">
                 {{ pattern }}
               </div>
@@ -465,10 +412,7 @@ function agentCardClasses(agent: StatusAgent): string {
           </div>
 
           <div v-if="agent.streams?.length">
-            <div
-              v-if="streamsForDisplay(agent).length"
-              class="overflow-x-auto"
-            >
+            <div v-if="streamsForDisplay(agent).length" class="overflow-x-auto">
               <table class="min-w-full divide-y divide-slate-800 text-sm">
                 <thead class="text-slate-400">
                   <tr>
@@ -481,11 +425,7 @@ function agentCardClasses(agent: StatusAgent): string {
                   </tr>
                 </thead>
                 <tbody class="divide-y divide-slate-800">
-                  <tr
-                    v-for="stream in streamsForDisplay(agent)"
-                    :key="stream.streamId"
-                    class="hover:bg-slate-900/80"
-                  >
+                  <tr v-for="stream in streamsForDisplay(agent)" :key="stream.streamId" class="hover:bg-slate-900/80">
                     <td class="px-3 py-2 font-mono text-xs text-slate-200">
                       {{ stream.streamId }}
                     </td>
@@ -508,26 +448,19 @@ function agentCardClasses(agent: StatusAgent): string {
                 </tbody>
               </table>
             </div>
-            <div
-              v-else
-              class="rounded-lg border border-dashed border-slate-800 bg-slate-900/80 p-4 text-sm text-slate-400"
-            >
+            <div v-else
+              class="rounded-lg border border-dashed border-slate-800 bg-slate-900/80 p-4 text-sm text-slate-400">
               Nenhum destino correspondente.
             </div>
           </div>
-          <div
-            v-else
-            class="rounded-lg border border-dashed border-slate-800 bg-slate-900/80 p-4 text-sm text-slate-400"
-          >
+          <div v-else
+            class="rounded-lg border border-dashed border-slate-800 bg-slate-900/80 p-4 text-sm text-slate-400">
             Nenhum fluxo ativo
           </div>
         </div>
       </article>
     </div>
-    <div
-      v-else
-      class="rounded-xl border border-dashed border-slate-800 bg-slate-900/40 p-6 text-center text-slate-400"
-    >
+    <div v-else class="rounded-xl border border-dashed border-slate-800 bg-slate-900/40 p-6 text-center text-slate-400">
       Nenhum agente encontrado.
     </div>
   </section>
