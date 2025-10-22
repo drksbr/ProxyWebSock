@@ -12,6 +12,7 @@ RELAY_ARGS := relay --agent-config ./config/agents.example.yaml --stream-id-mode
 AGENT_ARGS := agent --relay=wss://relay.neurocirurgiahgrs.com.br/tunnel --id=agente01 --token=troque-esta-senha --dial-timeout-ms=5000 --max-frame=32768 --read-buf=65536 --write-buf=65536
 
 PM ?= bun
+VERSION_SCRIPT := $(CURDIR)/scripts/sync-version.mjs
 
 ifeq ($(PM),bun)
   WEB_INSTALL_CMD := bun install
@@ -33,13 +34,17 @@ else
   $(error Unsupported package manager "$(PM)". Set PM=bun|npm|pnpm|yarn)
 endif
 
-.PHONY: all build web-install web-build go-build clean web-dev run run-relay run-agent relay-start relay-stop relay-restart docker-build docker-run compose-up compose-down
+.PHONY: all build web-install web-build go-build clean web-dev run run-relay run-agent relay-start relay-stop relay-restart docker-build docker-run compose-up compose-down version-sync
 
 all: build
 
 $(WEB_NODE_MODULES):
 	@echo "Installing web dependencies with $(PM)..."
 	@cd $(WEB_DIR) && $(WEB_INSTALL_CMD)
+
+version-sync:
+	@echo "Synchronizing version metadata..."
+	@node $(VERSION_SCRIPT)
 
 update:	
 	@echo "Updating project from git..."
@@ -54,7 +59,7 @@ mkln:
 
 web-install: $(WEB_NODE_MODULES)
 
-web-build: $(WEB_NODE_MODULES)
+web-build: version-sync $(WEB_NODE_MODULES)
 	@echo "Building web UI into internal/relay/dist..."
 	@cd $(WEB_DIR) && $(WEB_BUILD_CMD)
 
@@ -114,7 +119,7 @@ relay-restart:
 	@$(MAKE) relay-stop
 	@$(MAKE) relay-start
 
-web-dev:
+web-dev: version-sync
 	@cd $(WEB_DIR) && $(WEB_DEV_CMD)
 
 clean:

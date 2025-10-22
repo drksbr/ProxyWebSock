@@ -6,10 +6,20 @@ const props = defineProps<{
   secureAddr: string;
   socksAddr: string;
   acmeHosts: string[];
+  backendVersion: string;
+  frontendVersion: string;
 }>();
 
 const acmeLabel = computed(() => {
   return props.acmeHosts.length ? props.acmeHosts.join(" ") : "-";
+});
+
+const versionMismatch = computed(() => {
+  return (
+    props.backendVersion &&
+    props.frontendVersion &&
+    props.backendVersion !== props.frontendVersion
+  );
 });
 </script>
 
@@ -43,6 +53,28 @@ const acmeLabel = computed(() => {
       <div class="mb-2 text-sm text-slate-400">ACME Hosts</div>
       <div class="font-mono text-sm">
         {{ acmeLabel }}
+      </div>
+    </div>
+    <div
+      class="rounded-lg border border-slate-800 bg-slate-900/60 p-4"
+      :class="versionMismatch ? 'border-amber-500/50' : ''"
+    >
+      <div class="mb-2 text-sm text-slate-400">Versões</div>
+      <div class="space-y-1 text-sm">
+        <div>
+          Backend:
+          <span class="font-mono text-slate-100">{{ backendVersion || '-' }}</span>
+        </div>
+        <div>
+          Frontend:
+          <span class="font-mono text-slate-100">{{ frontendVersion }}</span>
+        </div>
+        <div
+          v-if="versionMismatch"
+          class="text-xs font-semibold uppercase tracking-wide text-amber-300"
+        >
+          Versões divergentes — atualize o frontend
+        </div>
       </div>
     </div>
   </header>

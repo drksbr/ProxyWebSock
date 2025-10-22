@@ -30,6 +30,7 @@ type heartbeatState struct {
 	cpuPercent          float64
 	rssBytes            uint64
 	goroutines          int
+	resourcesSampled    bool
 }
 
 func newHeartbeatState() *heartbeatState {
@@ -145,12 +146,13 @@ func (h *heartbeatState) updateResources(cpu float64, rss uint64, goroutines int
 	h.cpuPercent = cpu
 	h.rssBytes = rss
 	h.goroutines = goroutines
+	h.resourcesSampled = true
 	h.mu.Unlock()
 }
 
 func (h *heartbeatState) statsSnapshotLocked() *protocol.HeartbeatStats {
 	if h.lastRTT == 0 && h.jitter == 0 && h.consecutiveFailures == 0 && h.lastError == "" &&
-		len(h.pending) == 0 && h.lastSendDelay == 0 && h.cpuPercent == 0 && h.rssBytes == 0 && h.goroutines == 0 {
+		len(h.pending) == 0 && h.lastSendDelay == 0 && !h.resourcesSampled {
 		return nil
 	}
 	stats := &protocol.HeartbeatStats{
@@ -170,15 +172,9 @@ func (h *heartbeatState) statsSnapshotLocked() *protocol.HeartbeatStats {
 	if delay := durationToMillis(h.lastSendDelay); delay > 0 {
 		stats.SendDelayMillis = delay
 	}
-	if h.cpuPercent > 0 {
-		stats.CPUPercent = h.cpuPercent
-	}
-	if h.rssBytes > 0 {
-		stats.RSSBytes = h.rssBytes
-	}
-	if h.goroutines > 0 {
-		stats.Goroutines = h.goroutines
-	}
+	stats.CPUPercent = h.cpuPercent
+	stats.RSSBytes = h.rssBytes
+	stats.Goroutines = h.goroutines
 	return stats
 }
 

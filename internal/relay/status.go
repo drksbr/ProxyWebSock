@@ -9,17 +9,20 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/drksbr/ProxyWebSock/internal/version"
 )
 
 type statusPayload struct {
-	GeneratedAt time.Time        `json:"generatedAt"`
-	ProxyAddr   string           `json:"proxyAddr"`
-	SecureAddr  string           `json:"secureAddr"`
-	SocksAddr   string           `json:"socksAddr"`
-	ACMEHosts   []string         `json:"acmeHosts"`
-	Agents      []statusAgent    `json:"agents"`
-	Metrics     statusMetrics    `json:"metrics"`
-	Resources   resourceSnapshot `json:"resources"`
+	GeneratedAt    time.Time        `json:"generatedAt"`
+	ProxyAddr      string           `json:"proxyAddr"`
+	SecureAddr     string           `json:"secureAddr"`
+	SocksAddr      string           `json:"socksAddr"`
+	ACMEHosts      []string         `json:"acmeHosts"`
+	Agents         []statusAgent    `json:"agents"`
+	Metrics        statusMetrics    `json:"metrics"`
+	Resources      resourceSnapshot `json:"resources"`
+	BackendVersion string           `json:"backendVersion"`
 }
 
 type statusView struct {
@@ -151,7 +154,8 @@ func (s *relayServer) collectStatus(r *http.Request) statusPayload {
 			DialErrors:      s.stats.dialErrors.Load(),
 			AuthFailures:    s.stats.authFailures.Load(),
 		},
-		Resources: resources,
+		Resources:      resources,
+		BackendVersion: version.Version,
 	}
 }
 

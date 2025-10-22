@@ -12,6 +12,7 @@ import AppHeader from "./components/AppHeader.vue";
 import AgentsSection from "./components/agents/AgentsSection.vue";
 import ResourcesSection from "./components/resources/ResourcesSection.vue";
 import SummarySection from "./components/summary/SummarySection.vue";
+import { FRONTEND_VERSION } from "./version";
 import type {
   MetricsSnapshot,
   NetworkPoint,
@@ -75,6 +76,7 @@ const emptyStatus: StatusPayload = {
     current: { ...emptyPoint },
     history: [],
   },
+  backendVersion: "",
 };
 
 declare global {
@@ -89,6 +91,7 @@ const netRates = reactive<NetworkRates>({ in: 0, out: 0 });
 const lastMetrics = ref<MetricsSnapshot | null>(null);
 const netHistory = ref<NetworkPoint[]>([]);
 const refreshIntervalMs = ref<number>(3000);
+const frontendVersion = FRONTEND_VERSION;
 let pollTimer: number | null = null;
 
 const maxNetworkPoints = computed(
@@ -116,12 +119,7 @@ const summaryCards = computed(() => {
     {
       label: "Bytes (intranet → cliente)",
       value: formatBytes(metrics.bytesDown),
-    },
-    { label: "Falhas de Dial", value: formatCount(metrics.dialErrors) },
-    {
-      label: "Falhas de Autenticação",
-      value: formatCount(metrics.authFailures),
-    },
+    }
   ];
 });
 
@@ -135,6 +133,21 @@ watch(
     updateNetworkRates(payload);
   },
   { deep: true, immediate: true },
+);
+
+watch(
+  () => data.value.backendVersion,
+  (backendVersion) => {
+    if (backendVersion && backendVersion !== frontendVersion) {
+      console.warn(
+        "Versão incompatível: backend",
+        backendVersion,
+        "frontend",
+        frontendVersion,
+      );
+    }
+  },
+  { immediate: true },
 );
 
 watch(maxNetworkPoints, (limit) => {
@@ -188,11 +201,20 @@ function normalizePayload(payload?: StatusPayload): StatusPayload {
         lastHeartbeatAt: agent.lastHeartbeatAt ?? "",
         latencyMillis: agent.latencyMillis ?? 0,
         jitterMillis: agent.jitterMillis ?? 0,
+        heartbeatSendDelayMillis: agent.heartbeatSendDelayMillis ?? 0,
         heartbeatSeq: agent.heartbeatSeq ?? 0,
         heartbeatFailures: agent.heartbeatFailures ?? 0,
+        heartbeatPending: agent.heartbeatPending ?? 0,
         errorCount: agent.errorCount ?? 0,
         lastError: agent.lastError ?? "",
         lastErrorAt: agent.lastErrorAt ?? "",
+        relayControlQueueDepth: agent.relayControlQueueDepth ?? 0,
+        relayDataQueueDepth: agent.relayDataQueueDepth ?? 0,
+        agentControlQueueDepth: agent.agentControlQueueDepth ?? 0,
+        agentDataQueueDepth: agent.agentDataQueueDepth ?? 0,
+        agentCpuPercent: agent.agentCpuPercent ?? undefined,
+        agentRssBytes: agent.agentRssBytes ?? 0,
+        agentGoroutines: agent.agentGoroutines ?? 0,
         acl: agent.acl ?? [],
         streams: agent.streams ?? [],
         autoConfig: agent.autoConfig ?? "",
@@ -224,13 +246,16 @@ function normalizePayload(payload?: StatusPayload): StatusPayload {
       },
       history: payload.resources?.history ?? [],
     },
+    backendVersion: payload.backendVersion ?? "",
   };
 }
 
 function schedulePoll() {
   pollTimer = window.setTimeout(async () => {
     try {
-      const res = await fetch("https://relay.neurocirurgiahgrs.com.br/status.json", { cache: "no-store" });
+      const res = await fetch("https://relay.neurocirurgiahgrs.com.br/status.json", {
+        cache: "no-store",
+      });
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`);
       }
@@ -313,8 +338,14 @@ function handleRangeUpdate(minutes: number) {
 <template>
   <div class="min-h-screen bg-slate-950 text-slate-100">
     <div class="mx-auto flex max-w-6xl flex-col gap-10 px-4 py-8">
-      <AppHeader :proxy-addr="data.proxyAddr" :secure-addr="data.secureAddr" :socks-addr="data.socksAddr"
-        :acme-hosts="data.acmeHosts" />
+      <AppHeader
+        :proxy-addr="data.proxyAddr"
+        :secure-addr="data.secureAddr"
+        :socks-addr="data.socksAddr"
+        :acme-hosts="data.acmeHosts"
+        :backend-version="data.backendVersion ?? ''"
+        :frontend-version="frontendVersion"
+      />
 
       <SummarySection :generated-at="data.generatedAt" :refresh-options="REFRESH_OPTIONS"
         :selected-interval="refreshIntervalMs" :summary-cards="summaryCards"

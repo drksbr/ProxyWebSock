@@ -66,6 +66,7 @@ export type StatusPayload = {
   agents: StatusAgent[];
   metrics: StatusMetrics;
   resources: ResourceSnapshot;
+  backendVersion?: string;
 };
 
 export type NetworkRates = {
