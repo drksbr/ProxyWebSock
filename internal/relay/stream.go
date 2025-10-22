@@ -91,6 +91,7 @@ type relayStream struct {
 	backlogLimit       *bytelimiter.ByteLimiter
 	pendingClientBytes atomic.Int64
 	logger             *slog.Logger
+	queueClosed        atomic.Bool
 }
 
 func newRelayStream(id string, agent *relayAgentSession, proto streamProtocol, client net.Conn, bufrw *bufio.ReadWriter, host string, port int, queueDepth int) *relayStream {
@@ -265,6 +266,9 @@ func (s *relayStream) writeToClient(data []byte) error {
 	if s.isClosing() {
 		return errClientStreamClosed
 	}
+	if s.queueClosed.Load() {
+		return errClientStreamClosed
+	}
 	select {
 	case <-s.handshake:
 	case <-s.closing:
@@ -315,6 +319,7 @@ func (s *relayStream) shutdown(notifyAgent bool, err error) {
 	s.once.Do(func() {
 		s.markReady(err)
 		close(s.closing)
+		s.queueClosed.Store(true)
 		if s.writeQueue != nil {
 			close(s.writeQueue)
 		}

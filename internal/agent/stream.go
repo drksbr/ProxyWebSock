@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"github.com/drksbr/ProxyWebSock/internal/util/bytelimiter"
 )
@@ -26,6 +27,7 @@ type agentStream struct {
 	logger        *slog.Logger
 	closed        chan struct{}
 	closeOnce     sync.Once
+	queueClosed   atomic.Bool
 }
 
 const maxAgentPooledBuffer = 512 * 1024
@@ -82,6 +84,9 @@ func (s *agentStream) enqueueInbound(data []byte) error {
 		return nil
 	}
 	if s.isClosed() {
+		return errStreamClosed
+	}
+	if s.queueClosed.Load() {
 		return errStreamClosed
 	}
 	size := len(data)
@@ -160,6 +165,7 @@ func (s *agentStream) writerLoop() {
 func (s *agentStream) close() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
+		s.queueClosed.Store(true)
 		close(s.writeQueue)
 		s.conn.Close()
 		if s.outboundLimit != nil {
