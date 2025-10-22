@@ -17,6 +17,7 @@ type relayOptions struct {
 	agentConfig   string
 	aclPatterns   []string
 	maxFrame      int
+	maxInFlight   int
 	wsIdle        time.Duration
 	dialTimeoutMs int
 	acmeHosts     []string
@@ -39,6 +40,7 @@ func NewCommand(globals *runtime.Options) *cobra.Command {
 		secureListen:  ":8443",
 		socksListen:   "",
 		maxFrame:      32 * 1024,
+		maxInFlight:   256 * 1024,
 		wsIdle:        45 * time.Second,
 		dialTimeoutMs: 10000,
 		acmeHTTPAddr:  "",
@@ -72,6 +74,7 @@ func NewCommand(globals *runtime.Options) *cobra.Command {
 	cmd.Flags().StringVar(&opts.agentConfig, "agent-config", "", "path to YAML file containing agent definitions")
 	cmd.Flags().StringSliceVar(&opts.aclPatterns, "acl-allow", nil, "regex ACLs for allowed host:port destinations (repeatable)")
 	cmd.Flags().IntVar(&opts.maxFrame, "max-frame", opts.maxFrame, "maximum payload size per frame in bytes")
+	cmd.Flags().IntVar(&opts.maxInFlight, "max-inflight", opts.maxInFlight, "maximum queued bytes per stream when sending to clients (0 disables)")
 	cmd.Flags().DurationVar(&opts.wsIdle, "ws-idle", opts.wsIdle, "maximum idle time on agent websocket before disconnect")
 	cmd.Flags().IntVar(&opts.dialTimeoutMs, "dial-timeout-ms", opts.dialTimeoutMs, "timeout in milliseconds for agent dial acknowledgment (0 disables)")
 	cmd.Flags().StringSliceVar(&opts.acmeHosts, "acme-host", nil, "hostnames for Let's Encrypt certificates (repeatable)")

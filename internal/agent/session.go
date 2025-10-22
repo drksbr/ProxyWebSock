@@ -352,7 +352,7 @@ func (s *session) handleDial(f protocol.Frame) {
 		return
 	}
 
-	stream := newAgentStream(f.StreamID, conn, s.agent.opts.maxInFlight)
+	stream := newAgentStream(f.StreamID, conn, s.agent.opts.maxInFlight, s.logger)
 	if err := s.storeStream(stream); err != nil {
 		s.logger.Warn("stream register failed", "stream", f.StreamID, "error", err)
 		conn.Close()
@@ -541,21 +541,15 @@ func (s *session) handleBinaryWrite(streamID string, payload []byte) {
 		return
 	}
 
-	total := 0
-	for total < len(payload) {
-		n, err := stream.conn.Write(payload[total:])
-		if err != nil {
-			s.logger.Warn("stream write failed", "stream", streamID, "error", err)
-			s.heartbeat.recordError(err.Error())
-			stream.close()
-			_ = s.sendFrame(&protocol.Frame{
-				Type:     protocol.FrameTypeError,
-				StreamID: streamID,
-				Error:    err.Error(),
-			})
-			return
-		}
-		total += n
+	if err := stream.enqueueInbound(payload); err != nil && !errors.Is(err, errStreamClosed) {
+		s.logger.Warn("stream enqueue failed", "stream", streamID, "error", err)
+		s.heartbeat.recordError(err.Error())
+		stream.close()
+		_ = s.sendFrame(&protocol.Frame{
+			Type:     protocol.FrameTypeError,
+			StreamID: streamID,
+			Error:    err.Error(),
+		})
 	}
 }
 

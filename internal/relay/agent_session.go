@@ -429,10 +429,17 @@ func (s *relayAgentSession) handleBinaryWrite(streamID string, payload []byte) {
 		return
 	}
 	if err := stream.writeToClient(payload); err != nil {
-		s.server.logger.Debug("client write failed", "agent", s.id, "stream", streamID, "error", err)
+		if errors.Is(err, errClientStreamClosed) {
+			return
+		}
+		if errors.Is(err, errClientBacklog) {
+			s.server.logger.Warn("client backlog exceeded", "agent", s.id, "stream", streamID)
+		} else {
+			s.server.logger.Debug("enqueue to client failed", "agent", s.id, "stream", streamID, "error", err)
+		}
+		stream.closeFromRelay(err)
 		return
 	}
-	s.server.metrics.bytesDownstream.Add(float64(len(payload)))
 }
 
 func (s *relayAgentSession) handleClose(f protocol.Frame) {

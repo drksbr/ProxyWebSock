@@ -68,12 +68,15 @@ type statusAgent struct {
 }
 
 type statusStream struct {
-	StreamID  string    `json:"streamId"`
-	Target    string    `json:"target"`
-	Protocol  string    `json:"protocol"`
-	CreatedAt time.Time `json:"createdAt"`
-	BytesUp   int64     `json:"bytesUp"`
-	BytesDown int64     `json:"bytesDown"`
+	StreamID            string    `json:"streamId"`
+	Target              string    `json:"target"`
+	Protocol            string    `json:"protocol"`
+	CreatedAt           time.Time `json:"createdAt"`
+	BytesUp             int64     `json:"bytesUp"`
+	BytesDown           int64     `json:"bytesDown"`
+	PendingClientBytes  int64     `json:"pendingClientBytes,omitempty"`
+	PendingClientChunks int       `json:"pendingClientChunks,omitempty"`
+	ClientBacklogLimit  int       `json:"clientBacklogLimit,omitempty"`
 }
 
 func (s *relayServer) collectStatus(r *http.Request) statusPayload {

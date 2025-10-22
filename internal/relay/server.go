@@ -84,6 +84,9 @@ func newRelayServer(logger *slog.Logger, opts *relayOptions) (*relayServer, erro
 	if opts.maxFrame <= 0 {
 		return nil, errors.New("--max-frame must be positive")
 	}
+	if opts.maxInFlight < 0 {
+		return nil, errors.New("--max-inflight cannot be negative")
+	}
 
 	if len(opts.acmeHosts) == 0 {
 		return nil, errors.New("at least one --acme-host is required for Let's Encrypt")

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"strconv"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/drksbr/ProxyWebSock/internal/protocol"
+	"github.com/drksbr/ProxyWebSock/internal/util/bytelimiter"
 )
 
 type streamProtocol int
@@ -32,6 +34,16 @@ func (p streamProtocol) String() string {
 	}
 }
 
+var (
+	errClientStreamClosed = errors.New("stream closed")
+	errClientBacklog      = errors.New("client backlog exceeded")
+)
+
+type relayWriteRequest struct {
+	data []byte
+	size int
+}
+
 type relayStream struct {
 	id         string
 	agent      *relayAgentSession
@@ -48,21 +60,79 @@ type relayStream struct {
 	handshake  chan struct{}
 	bytesUp    atomic.Int64
 	bytesDown  atomic.Int64
+
+	writeQueue         chan relayWriteRequest
+	writerOnce         sync.Once
+	backlogLimit       *bytelimiter.ByteLimiter
+	pendingClientBytes atomic.Int64
+	logger             *slog.Logger
 }
 
 func newRelayStream(id string, agent *relayAgentSession, proto streamProtocol, client net.Conn, bufrw *bufio.ReadWriter, host string, port int) *relayStream {
-	return &relayStream{
-		id:         id,
-		agent:      agent,
-		client:     client,
-		bufrw:      bufrw,
-		protocol:   proto,
-		targetHost: host,
-		targetPort: port,
-		createdAt:  time.Now(),
-		closing:    make(chan struct{}),
-		readyCh:    make(chan error, 1),
-		handshake:  make(chan struct{}),
+	streamLogger := agent.server.logger.With("agent", agent.id, "stream", id)
+	rs := &relayStream{
+		id:           id,
+		agent:        agent,
+		client:       client,
+		bufrw:        bufrw,
+		protocol:     proto,
+		targetHost:   host,
+		targetPort:   port,
+		createdAt:    time.Now(),
+		closing:      make(chan struct{}),
+		readyCh:      make(chan error, 1),
+		handshake:    make(chan struct{}),
+		writeQueue:   make(chan relayWriteRequest, 64),
+		backlogLimit: bytelimiter.New(agent.server.opts.maxInFlight),
+		logger:       streamLogger,
+	}
+	rs.startWriter()
+	return rs
+}
+
+func (s *relayStream) startWriter() {
+	s.writerOnce.Do(func() {
+		go s.writerLoop()
+	})
+}
+
+func (s *relayStream) writerLoop() {
+	for {
+		select {
+		case req, ok := <-s.writeQueue:
+			if !ok {
+				return
+			}
+			if req.size == 0 {
+				continue
+			}
+			total := 0
+			for total < len(req.data) {
+				n, err := s.client.Write(req.data[total:])
+				if err != nil {
+					if s.logger != nil {
+						s.logger.Debug("client write failed", "error", err)
+					}
+					s.closeFromRelay(err)
+					break
+				}
+				total += n
+			}
+			if total > 0 {
+				s.bytesDown.Add(int64(total))
+				s.agent.server.metrics.bytesDownstream.Add(float64(total))
+				s.agent.server.stats.bytesDown.Add(int64(total))
+			}
+			newPending := s.pendingClientBytes.Add(-int64(req.size))
+			if newPending < 0 {
+				s.pendingClientBytes.Store(0)
+			}
+			if s.backlogLimit != nil {
+				s.backlogLimit.Release(req.size)
+			}
+		case <-s.closing:
+			return
+		}
 	}
 }
 
@@ -148,27 +218,50 @@ func (s *relayStream) pipeClientOutbound() {
 	}
 }
 
+func (s *relayStream) isClosing() bool {
+	select {
+	case <-s.closing:
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *relayStream) writeToClient(data []byte) error {
 	if len(data) == 0 {
 		return nil
 	}
+	if s.isClosing() {
+		return errClientStreamClosed
+	}
 	select {
 	case <-s.handshake:
 	case <-s.closing:
-		return errors.New("stream closed")
+		return errClientStreamClosed
 	}
-	total := 0
-	for total < len(data) {
-		n, err := s.client.Write(data[total:])
-		if err != nil {
-			s.closeFromRelay(err)
-			return err
+	size := len(data)
+	if s.backlogLimit != nil && !s.backlogLimit.TryAcquire(size) {
+		return errClientBacklog
+	}
+	req := relayWriteRequest{
+		data: data,
+		size: size,
+	}
+	select {
+	case s.writeQueue <- req:
+		s.pendingClientBytes.Add(int64(size))
+		return nil
+	case <-s.closing:
+		if s.backlogLimit != nil {
+			s.backlogLimit.Release(size)
 		}
-		total += n
+		return errClientStreamClosed
+	default:
+		if s.backlogLimit != nil {
+			s.backlogLimit.Release(size)
+		}
+		return errClientBacklog
 	}
-	s.bytesDown.Add(int64(total))
-	s.agent.server.stats.bytesDown.Add(int64(total))
-	return nil
 }
 
 func (s *relayStream) closeFromRelay(err error) {
@@ -187,6 +280,13 @@ func (s *relayStream) shutdown(notifyAgent bool, err error) {
 	s.once.Do(func() {
 		s.markReady(err)
 		close(s.closing)
+		if s.writeQueue != nil {
+			close(s.writeQueue)
+		}
+		if s.backlogLimit != nil {
+			s.backlogLimit.Close()
+		}
+		s.pendingClientBytes.Store(0)
 		s.agent.removeStream(s.id)
 		_ = s.client.Close()
 		if notifyAgent {
@@ -210,12 +310,24 @@ func (s *relayStream) target() string {
 }
 
 func (s *relayStream) stats() statusStream {
+	pendingBytes := s.pendingClientBytes.Load()
+	pendingChunks := 0
+	if s.writeQueue != nil {
+		pendingChunks = len(s.writeQueue)
+	}
+	backlogLimit := 0
+	if s.backlogLimit != nil {
+		backlogLimit = s.backlogLimit.Capacity()
+	}
 	return statusStream{
-		StreamID:  s.id,
-		Target:    s.target(),
-		Protocol:  s.protocol.String(),
-		CreatedAt: s.createdAt,
-		BytesUp:   s.bytesUp.Load(),
-		BytesDown: s.bytesDown.Load(),
+		StreamID:            s.id,
+		Target:              s.target(),
+		Protocol:            s.protocol.String(),
+		CreatedAt:           s.createdAt,
+		BytesUp:             s.bytesUp.Load(),
+		BytesDown:           s.bytesDown.Load(),
+		PendingClientBytes:  pendingBytes,
+		PendingClientChunks: pendingChunks,
+		ClientBacklogLimit:  backlogLimit,
 	}
 }
