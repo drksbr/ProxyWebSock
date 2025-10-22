@@ -18,6 +18,7 @@ type heartbeatState struct {
 
 	mu                  sync.Mutex
 	pending             map[uint64]time.Time
+	scheduled           map[uint64]time.Time
 	lastRTT             time.Duration
 	jitter              time.Duration
 	consecutiveFailures int
@@ -25,11 +26,16 @@ type heartbeatState struct {
 	lastSent            time.Time
 	lastError           string
 	lastErrorAt         time.Time
+	lastSendDelay       time.Duration
+	cpuPercent          float64
+	rssBytes            uint64
+	goroutines          int
 }
 
 func newHeartbeatState() *heartbeatState {
 	return &heartbeatState{
-		pending: make(map[uint64]time.Time),
+		pending:   make(map[uint64]time.Time),
+		scheduled: make(map[uint64]time.Time),
 	}
 }
 
@@ -40,17 +46,28 @@ func (h *heartbeatState) nextPayload(now time.Time) *protocol.HeartbeatPayload {
 
 	payload := &protocol.HeartbeatPayload{
 		Sequence: seq,
-		SentAt:   now.UnixNano(),
 		Mode:     protocol.HeartbeatModePing,
 	}
 	if stats := h.statsSnapshotLocked(); stats != nil {
 		payload.Stats = stats
 	}
+	h.scheduled[seq] = now
 	return payload
 }
 
 func (h *heartbeatState) markSent(seq uint64, sentAt time.Time) {
 	h.mu.Lock()
+	if sentAt.IsZero() {
+		sentAt = time.Now()
+	}
+	if scheduledAt, ok := h.scheduled[seq]; ok {
+		delete(h.scheduled, seq)
+		delay := sentAt.Sub(scheduledAt)
+		if delay < 0 {
+			delay = 0
+		}
+		h.lastSendDelay = delay
+	}
 	h.pending[seq] = sentAt
 	h.lastSent = sentAt
 	h.mu.Unlock()
@@ -98,6 +115,12 @@ func (h *heartbeatState) handleAck(seq uint64, ackTime time.Time) {
 
 func (h *heartbeatState) expirePending(now time.Time) {
 	h.mu.Lock()
+	for seq, scheduledAt := range h.scheduled {
+		if now.Sub(scheduledAt) > heartbeatTimeout {
+			delete(h.scheduled, seq)
+			h.consecutiveFailures++
+		}
+	}
 	for seq, sentAt := range h.pending {
 		if now.Sub(sentAt) > heartbeatTimeout {
 			delete(h.pending, seq)
@@ -117,8 +140,17 @@ func (h *heartbeatState) recordError(message string) {
 	h.mu.Unlock()
 }
 
+func (h *heartbeatState) updateResources(cpu float64, rss uint64, goroutines int) {
+	h.mu.Lock()
+	h.cpuPercent = cpu
+	h.rssBytes = rss
+	h.goroutines = goroutines
+	h.mu.Unlock()
+}
+
 func (h *heartbeatState) statsSnapshotLocked() *protocol.HeartbeatStats {
-	if h.lastRTT == 0 && h.jitter == 0 && h.consecutiveFailures == 0 && h.lastError == "" {
+	if h.lastRTT == 0 && h.jitter == 0 && h.consecutiveFailures == 0 && h.lastError == "" &&
+		len(h.pending) == 0 && h.lastSendDelay == 0 && h.cpuPercent == 0 && h.rssBytes == 0 && h.goroutines == 0 {
 		return nil
 	}
 	stats := &protocol.HeartbeatStats{
@@ -131,6 +163,21 @@ func (h *heartbeatState) statsSnapshotLocked() *protocol.HeartbeatStats {
 		if !h.lastErrorAt.IsZero() {
 			stats.LastErrorAt = h.lastErrorAt.UnixNano()
 		}
+	}
+	if pending := len(h.pending); pending > 0 {
+		stats.Pending = pending
+	}
+	if delay := durationToMillis(h.lastSendDelay); delay > 0 {
+		stats.SendDelayMillis = delay
+	}
+	if h.cpuPercent > 0 {
+		stats.CPUPercent = h.cpuPercent
+	}
+	if h.rssBytes > 0 {
+		stats.RSSBytes = h.rssBytes
+	}
+	if h.goroutines > 0 {
+		stats.Goroutines = h.goroutines
 	}
 	return stats
 }

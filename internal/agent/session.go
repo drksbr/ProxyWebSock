@@ -19,8 +19,9 @@ import (
 var errWriterClosed = errors.New("writer closed")
 
 type outboundMessage struct {
-	frame  *protocol.Frame
-	binary []byte
+	frame   *protocol.Frame
+	binary  []byte
+	onWrite func(success bool)
 }
 
 type session struct {
@@ -87,9 +88,15 @@ func (s *session) writerLoop() {
 					controlCh = nil
 					continue
 				}
-				if err := s.writeMessage(msg); err != nil {
+				if err := s.writeMessage(&msg); err != nil {
+					if msg.onWrite != nil {
+						msg.onWrite(false)
+					}
 					s.logger.Warn("writer failed", "error", err)
 					return
+				}
+				if msg.onWrite != nil {
+					msg.onWrite(true)
 				}
 				continue
 			default:
@@ -121,33 +128,67 @@ func (s *session) writerLoop() {
 				continue
 			}
 		}
-		if err := s.writeMessage(msg); err != nil {
+		if err := s.writeMessage(&msg); err != nil {
+			if msg.onWrite != nil {
+				msg.onWrite(false)
+			}
 			s.logger.Warn("writer failed", "error", err)
 			return
+		}
+		if msg.onWrite != nil {
+			msg.onWrite(true)
 		}
 	}
 }
 
-func (s *session) writeMessage(msg outboundMessage) error {
+func (s *session) writeMessage(msg *outboundMessage) error {
+	if msg == nil {
+		return nil
+	}
 	if msg.frame != nil {
+		frame := msg.frame
 		if err := s.conn.SetWriteDeadline(time.Now().Add(20 * time.Second)); err != nil {
 			return err
 		}
-		err := s.conn.WriteJSON(msg.frame)
-		if err == nil {
-			err = s.conn.SetWriteDeadline(time.Time{})
+		var sendTime time.Time
+		if frame.Type == protocol.FrameTypeHeartbeat && frame.Heartbeat != nil {
+			if frame.Heartbeat.Mode == protocol.HeartbeatModePing && frame.Heartbeat.SentAt == 0 {
+				sendTime = time.Now()
+				frame.Heartbeat.SentAt = sendTime.UnixNano()
+			}
 		}
-		return err
+		writeErr := s.conn.WriteJSON(frame)
+		if frame.Type == protocol.FrameTypeHeartbeat && frame.Heartbeat != nil && frame.Heartbeat.Mode == protocol.HeartbeatModePing {
+			if writeErr == nil {
+				if sendTime.IsZero() {
+					sendTime = time.Unix(0, frame.Heartbeat.SentAt)
+				}
+				s.heartbeat.markSent(frame.Heartbeat.Sequence, sendTime)
+				s.heartbeat.expirePending(sendTime)
+			} else {
+				s.heartbeat.markSendFailure()
+			}
+		}
+		if writeErr != nil {
+			return writeErr
+		}
+		if err := s.conn.SetWriteDeadline(time.Time{}); err != nil {
+			s.logger.Debug("reset write deadline failed", "error", err)
+		}
+		return nil
 	}
 	if len(msg.binary) > 0 {
 		if err := s.conn.SetWriteDeadline(time.Now().Add(20 * time.Second)); err != nil {
 			return err
 		}
-		err := s.conn.WriteMessage(websocket.BinaryMessage, msg.binary)
-		if err == nil {
-			err = s.conn.SetWriteDeadline(time.Time{})
+		writeErr := s.conn.WriteMessage(websocket.BinaryMessage, msg.binary)
+		if writeErr != nil {
+			return writeErr
 		}
-		return err
+		if err := s.conn.SetWriteDeadline(time.Time{}); err != nil {
+			s.logger.Debug("reset write deadline failed", "error", err)
+		}
+		return nil
 	}
 	return nil
 }
@@ -413,8 +454,28 @@ func (s *session) heartbeatLoop(ctx context.Context) {
 func (s *session) sendHeartbeat() {
 	now := time.Now()
 	payload := s.heartbeat.nextPayload(now)
+	s.heartbeat.expirePending(now)
 	if payload == nil {
 		return
+	}
+	controlDepth := 0
+	if s.controlQueue != nil {
+		controlDepth = len(s.controlQueue)
+	}
+	dataDepth := 0
+	if s.dataQueue != nil {
+		dataDepth = len(s.dataQueue)
+	}
+	if controlDepth > 0 || dataDepth > 0 {
+		if payload.Stats == nil {
+			payload.Stats = &protocol.HeartbeatStats{}
+		}
+		if controlDepth > 0 {
+			payload.Stats.ControlQueueDepth = controlDepth
+		}
+		if dataDepth > 0 {
+			payload.Stats.DataQueueDepth = dataDepth
+		}
 	}
 	frame := &protocol.Frame{
 		Type:      protocol.FrameTypeHeartbeat,
@@ -425,8 +486,6 @@ func (s *session) sendHeartbeat() {
 		s.heartbeat.markSendFailure()
 		return
 	}
-	s.heartbeat.markSent(payload.Sequence, now)
-	s.heartbeat.expirePending(now)
 }
 
 func (s *session) handleBinaryWrite(streamID string, payload []byte) {
@@ -464,12 +523,12 @@ func (s *session) sendFrame(f *protocol.Frame) error {
 	return s.enqueueControl(outboundMessage{frame: f})
 }
 
-func (s *session) sendBinary(streamID string, payload []byte) error {
+func (s *session) sendBinary(streamID string, payload []byte, onWrite func(success bool)) error {
 	data, err := protocol.EncodeBinaryFrame(streamID, payload)
 	if err != nil {
 		return err
 	}
-	return s.enqueueData(outboundMessage{binary: data})
+	return s.enqueueData(outboundMessage{binary: data, onWrite: onWrite})
 }
 
 func (s *session) storeStream(stream *agentStream) error {
@@ -522,9 +581,12 @@ func (s *session) pipeOutbound(stream *agentStream) {
 		if n > 0 {
 			chunk := buf[:n]
 			stream.acquire(n)
-			errSend := s.sendBinary(stream.id, chunk)
-			stream.release(n)
+			chunkSize := n
+			errSend := s.sendBinary(stream.id, chunk, func(bool) {
+				stream.release(chunkSize)
+			})
 			if errSend != nil {
+				stream.release(chunkSize)
 				s.logger.Warn("send payload failed", "stream", stream.id, "error", errSend)
 				return
 			}

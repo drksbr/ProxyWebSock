@@ -21,6 +21,19 @@ const (
 	heartbeatDegradedAfter    = 3 * heartbeatExpectedInterval
 )
 
+type outboundMessage struct {
+	frame   *protocol.Frame
+	binary  []byte
+	control *controlMessage
+	onWrite func(success bool)
+}
+
+type controlMessage struct {
+	messageType int
+	data        []byte
+	deadline    time.Duration
+}
+
 type relayAgentSession struct {
 	server *relayServer
 	conn   *websocket.Conn
@@ -33,13 +46,18 @@ type relayAgentSession struct {
 	remote         string
 	connectedAt    time.Time
 
-	writeMu   sync.Mutex
 	streams   map[string]*relayStream
 	streamsMu sync.RWMutex
 
 	shutdown chan struct{}
 	closed   bool
 	closeMu  sync.Mutex
+
+	controlQueue  chan outboundMessage
+	dataQueue     chan outboundMessage
+	writerDone    chan struct{}
+	writerStarted bool
+	writerClose   sync.Once
 
 	heartbeatMu          sync.Mutex
 	lastHeartbeat        time.Time
@@ -49,6 +67,10 @@ type relayAgentSession struct {
 	heartbeatFailures    int
 	lastHeartbeatError   string
 	lastHeartbeatErrorAt time.Time
+	heartbeatSendDelay   time.Duration
+	heartbeatPending     int
+	agentControlQueue    int
+	agentDataQueue       int
 
 	errorMu     sync.Mutex
 	errorCount  int64
@@ -56,20 +78,181 @@ type relayAgentSession struct {
 	lastErrorAt time.Time
 }
 
-var errSessionClosed = errors.New("agent session closed")
+var (
+	errSessionClosed = errors.New("agent session closed")
+	errWriterClosed  = errors.New("writer closed")
+)
 
 func newRelayAgentSession(server *relayServer, conn *websocket.Conn, remote string) *relayAgentSession {
 	return &relayAgentSession{
-		server:   server,
-		conn:     conn,
-		remote:   remote,
-		streams:  make(map[string]*relayStream),
-		shutdown: make(chan struct{}),
+		server:       server,
+		conn:         conn,
+		remote:       remote,
+		streams:      make(map[string]*relayStream),
+		shutdown:     make(chan struct{}),
+		controlQueue: make(chan outboundMessage, 128),
+		dataQueue:    make(chan outboundMessage, 256),
+		writerDone:   make(chan struct{}),
 	}
+}
+
+func (s *relayAgentSession) startWriter() {
+	if s.writerStarted {
+		return
+	}
+	s.writerStarted = true
+	go s.writerLoop()
+}
+
+func (s *relayAgentSession) stopWriter() {
+	s.writerClose.Do(func() {
+		if s.controlQueue != nil {
+			close(s.controlQueue)
+		}
+		if s.dataQueue != nil {
+			close(s.dataQueue)
+		}
+	})
+	if s.writerStarted {
+		<-s.writerDone
+		s.writerStarted = false
+	}
+}
+
+func (s *relayAgentSession) writerLoop() {
+	defer close(s.writerDone)
+	controlCh := s.controlQueue
+	dataCh := s.dataQueue
+	for controlCh != nil || dataCh != nil {
+		var (
+			msg outboundMessage
+			ok  bool
+		)
+		if controlCh != nil {
+			select {
+			case msg, ok = <-controlCh:
+				if !ok {
+					controlCh = nil
+					continue
+				}
+				if err := s.writeMessage(&msg); err != nil {
+					if msg.onWrite != nil {
+						msg.onWrite(false)
+					}
+					s.server.logger.Warn("writer failed", "agent", s.id, "error", err)
+					return
+				}
+				if msg.onWrite != nil {
+					msg.onWrite(true)
+				}
+				continue
+			default:
+			}
+		}
+		if controlCh != nil && dataCh != nil {
+			select {
+			case msg, ok = <-controlCh:
+				if !ok {
+					controlCh = nil
+					continue
+				}
+			case msg, ok = <-dataCh:
+				if !ok {
+					dataCh = nil
+					continue
+				}
+			}
+		} else if controlCh != nil {
+			msg, ok = <-controlCh
+			if !ok {
+				controlCh = nil
+				continue
+			}
+		} else {
+			msg, ok = <-dataCh
+			if !ok {
+				dataCh = nil
+				continue
+			}
+		}
+		if err := s.writeMessage(&msg); err != nil {
+			if msg.onWrite != nil {
+				msg.onWrite(false)
+			}
+			s.server.logger.Warn("writer failed", "agent", s.id, "error", err)
+			return
+		}
+		if msg.onWrite != nil {
+			msg.onWrite(true)
+		}
+	}
+}
+
+func (s *relayAgentSession) writeMessage(msg *outboundMessage) error {
+	if msg == nil {
+		return nil
+	}
+	if msg.control != nil {
+		ctrl := msg.control
+		deadline := ctrl.deadline
+		if deadline <= 0 {
+			deadline = 5 * time.Second
+		}
+		return s.conn.WriteControl(ctrl.messageType, ctrl.data, time.Now().Add(deadline))
+	}
+	if msg.frame != nil {
+		if err := s.conn.SetWriteDeadline(time.Now().Add(20 * time.Second)); err != nil {
+			return err
+		}
+		writeErr := s.conn.WriteJSON(msg.frame)
+		if writeErr != nil {
+			return writeErr
+		}
+		if err := s.conn.SetWriteDeadline(time.Time{}); err != nil {
+			s.server.logger.Debug("reset write deadline failed", "agent", s.id, "error", err)
+		}
+		return nil
+	}
+	if len(msg.binary) > 0 {
+		if err := s.conn.SetWriteDeadline(time.Now().Add(20 * time.Second)); err != nil {
+			return err
+		}
+		writeErr := s.conn.WriteMessage(websocket.BinaryMessage, msg.binary)
+		if writeErr != nil {
+			return writeErr
+		}
+		if err := s.conn.SetWriteDeadline(time.Time{}); err != nil {
+			s.server.logger.Debug("reset write deadline failed", "agent", s.id, "error", err)
+		}
+		return nil
+	}
+	return nil
+}
+
+func (s *relayAgentSession) enqueueControl(msg outboundMessage) error {
+	return s.enqueueMessage(s.controlQueue, msg)
+}
+
+func (s *relayAgentSession) enqueueData(msg outboundMessage) error {
+	return s.enqueueMessage(s.dataQueue, msg)
+}
+
+func (s *relayAgentSession) enqueueMessage(ch chan outboundMessage, msg outboundMessage) (err error) {
+	if ch == nil {
+		return errWriterClosed
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = errWriterClosed
+		}
+	}()
+	ch <- msg
+	return nil
 }
 
 func (s *relayAgentSession) run() {
 	defer s.close()
+	defer s.stopWriter()
 
 	if err := s.performRegister(); err != nil {
 		s.server.logger.Warn("register failed", "error", err, "remote", s.remote)
@@ -78,6 +261,7 @@ func (s *relayAgentSession) run() {
 
 	s.connectedAt = time.Now()
 	s.server.registerAgent(s)
+	s.startWriter()
 	s.server.logger.Info("agent connected", "agent", s.id, "remote", s.remote)
 
 	readDone := make(chan struct{})
@@ -331,16 +515,10 @@ func (s *relayAgentSession) removeStream(streamID string) {
 }
 
 func (s *relayAgentSession) send(f *protocol.Frame) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if err := s.conn.SetWriteDeadline(time.Now().Add(20 * time.Second)); err != nil {
-		return err
+	if f == nil {
+		return nil
 	}
-	err := s.conn.WriteJSON(f)
-	if err == nil {
-		err = s.conn.SetWriteDeadline(time.Time{})
-	}
-	return err
+	return s.enqueueControl(outboundMessage{frame: f})
 }
 
 func (s *relayAgentSession) sendBinary(streamID string, payload []byte) error {
@@ -348,22 +526,16 @@ func (s *relayAgentSession) sendBinary(streamID string, payload []byte) error {
 	if err != nil {
 		return err
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if err := s.conn.SetWriteDeadline(time.Now().Add(20 * time.Second)); err != nil {
-		return err
-	}
-	err = s.conn.WriteMessage(websocket.BinaryMessage, data)
-	if err == nil {
-		err = s.conn.SetWriteDeadline(time.Time{})
-	}
-	return err
+	return s.enqueueData(outboundMessage{binary: data})
 }
 
 func (s *relayAgentSession) sendControl(messageType int) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	return s.conn.WriteControl(messageType, nil, time.Now().Add(5*time.Second))
+	return s.enqueueControl(outboundMessage{
+		control: &controlMessage{
+			messageType: messageType,
+			deadline:    5 * time.Second,
+		},
+	})
 }
 
 func (s *relayAgentSession) close() {
@@ -377,6 +549,7 @@ func (s *relayAgentSession) close() {
 	s.closeMu.Unlock()
 
 	s.conn.Close()
+	s.stopWriter()
 	if s.id != "" {
 		s.server.unregisterAgent(s.id)
 	}
@@ -414,6 +587,14 @@ func (s *relayAgentSession) updateHeartbeatFromAgent(payload *protocol.Heartbeat
 		} else {
 			s.heartbeatFailures = 0
 		}
+		if payload.Stats.SendDelayMillis > 0 {
+			s.heartbeatSendDelay = millisToDuration(payload.Stats.SendDelayMillis)
+		} else {
+			s.heartbeatSendDelay = 0
+		}
+		s.heartbeatPending = payload.Stats.Pending
+		s.agentControlQueue = payload.Stats.ControlQueueDepth
+		s.agentDataQueue = payload.Stats.DataQueueDepth
 		if payload.Stats.LastError != "" {
 			s.lastHeartbeatError = payload.Stats.LastError
 			if payload.Stats.LastErrorAt != 0 {
@@ -427,6 +608,10 @@ func (s *relayAgentSession) updateHeartbeatFromAgent(payload *protocol.Heartbeat
 			s.latency = safeLatencyFromSent(payload.SentAt, now)
 		}
 		s.heartbeatFailures = 0
+		s.heartbeatSendDelay = 0
+		s.heartbeatPending = 0
+		s.agentControlQueue = 0
+		s.agentDataQueue = 0
 	}
 	s.heartbeatMu.Unlock()
 }
@@ -485,6 +670,10 @@ func (s *relayAgentSession) snapshot() statusAgent {
 	failures := s.heartbeatFailures
 	hbLastError := s.lastHeartbeatError
 	hbLastErrorAt := s.lastHeartbeatErrorAt
+	sendDelay := s.heartbeatSendDelay
+	pending := s.heartbeatPending
+	agentControlQueue := s.agentControlQueue
+	agentDataQueue := s.agentDataQueue
 	s.heartbeatMu.Unlock()
 
 	if lastHeartbeat.IsZero() {
@@ -502,6 +691,12 @@ func (s *relayAgentSession) snapshot() statusAgent {
 	agent.JitterMillis = durationToMillis(jitter)
 	agent.HeartbeatSeq = seq
 	agent.HeartbeatFailures = failures
+	if sendDelay > 0 {
+		agent.HeartbeatSendDelayMillis = durationToMillis(sendDelay)
+	}
+	if pending > 0 {
+		agent.HeartbeatPending = pending
+	}
 
 	s.errorMu.Lock()
 	agent.ErrorCount = s.errorCount
@@ -521,6 +716,20 @@ func (s *relayAgentSession) snapshot() statusAgent {
 	if len(s.aclPatterns) > 0 {
 		agent.ACL = append(agent.ACL, s.aclPatterns...)
 	}
+	if depth := len(s.controlQueue); depth > 0 {
+		agent.RelayControlQueueDepth = depth
+	}
+	if depth := len(s.dataQueue); depth > 0 {
+		agent.RelayDataQueueDepth = depth
+	}
+	if agentControlQueue > 0 {
+		agent.AgentControlQueueDepth = agentControlQueue
+	}
+
+	if agentDataQueue > 0 {
+		agent.AgentDataQueueDepth = agentDataQueue
+	}
+
 	s.streamsMu.RLock()
 	if len(s.streams) > 0 {
 		agent.Streams = make([]statusStream, 0, len(s.streams))

@@ -86,6 +86,13 @@ type HeartbeatStats struct {
 	ConsecutiveFailures int     `json:"consecutiveFailures,omitempty"`
 	LastError           string  `json:"lastError,omitempty"`
 	LastErrorAt         int64   `json:"lastErrorAt,omitempty"`
+	Pending             int     `json:"pending,omitempty"`
+	SendDelayMillis     float64 `json:"sendDelayMillis,omitempty"`
+	ControlQueueDepth   int     `json:"controlQueueDepth,omitempty"`
+	DataQueueDepth      int     `json:"dataQueueDepth,omitempty"`
+	CPUPercent          float64 `json:"cpuPercent,omitempty"`
+	RSSBytes            uint64  `json:"rssBytes,omitempty"`
+	Goroutines          int     `json:"goroutines,omitempty"`
 }
 
 type HeartbeatPayload struct {

@@ -36,23 +36,29 @@ type statusMetrics struct {
 }
 
 type statusAgent struct {
-	ID                string         `json:"id"`
-	Identification    string         `json:"identification"`
-	Location          string         `json:"location"`
-	Status            string         `json:"status"`
-	Remote            string         `json:"remote,omitempty"`
-	ConnectedAt       time.Time      `json:"connectedAt,omitempty"`
-	LastHeartbeatAt   time.Time      `json:"lastHeartbeatAt,omitempty"`
-	LatencyMillis     float64        `json:"latencyMillis,omitempty"`
-	JitterMillis      float64        `json:"jitterMillis,omitempty"`
-	HeartbeatSeq      uint64         `json:"heartbeatSeq,omitempty"`
-	HeartbeatFailures int            `json:"heartbeatFailures,omitempty"`
-	ErrorCount        int64          `json:"errorCount,omitempty"`
-	LastError         string         `json:"lastError,omitempty"`
-	LastErrorAt       time.Time      `json:"lastErrorAt,omitempty"`
-	ACL               []string       `json:"acl,omitempty"`
-	Streams           []statusStream `json:"streams"`
-	AutoConfig        string         `json:"autoConfig,omitempty"`
+	ID                       string         `json:"id"`
+	Identification           string         `json:"identification"`
+	Location                 string         `json:"location"`
+	Status                   string         `json:"status"`
+	Remote                   string         `json:"remote,omitempty"`
+	ConnectedAt              time.Time      `json:"connectedAt,omitempty"`
+	LastHeartbeatAt          time.Time      `json:"lastHeartbeatAt,omitempty"`
+	LatencyMillis            float64        `json:"latencyMillis,omitempty"`
+	JitterMillis             float64        `json:"jitterMillis,omitempty"`
+	HeartbeatSendDelayMillis float64        `json:"heartbeatSendDelayMillis,omitempty"`
+	HeartbeatSeq             uint64         `json:"heartbeatSeq,omitempty"`
+	HeartbeatFailures        int            `json:"heartbeatFailures,omitempty"`
+	HeartbeatPending         int            `json:"heartbeatPending,omitempty"`
+	ErrorCount               int64          `json:"errorCount,omitempty"`
+	LastError                string         `json:"lastError,omitempty"`
+	LastErrorAt              time.Time      `json:"lastErrorAt,omitempty"`
+	ACL                      []string       `json:"acl,omitempty"`
+	RelayControlQueueDepth   int            `json:"relayControlQueueDepth,omitempty"`
+	RelayDataQueueDepth      int            `json:"relayDataQueueDepth,omitempty"`
+	AgentControlQueueDepth   int            `json:"agentControlQueueDepth,omitempty"`
+	AgentDataQueueDepth      int            `json:"agentDataQueueDepth,omitempty"`
+	Streams                  []statusStream `json:"streams"`
+	AutoConfig               string         `json:"autoConfig,omitempty"`
 }
 
 type statusStream struct {
