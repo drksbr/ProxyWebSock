@@ -44,7 +44,7 @@ $(WEB_NODE_MODULES):
 
 version-sync:
 	@echo "Synchronizing version metadata..."
-	@node $(VERSION_SCRIPT)
+	@bun $(VERSION_SCRIPT)
 
 update:	
 	@echo "Updating project from git..."
