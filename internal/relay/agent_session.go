@@ -433,7 +433,7 @@ func (s *relayAgentSession) handleBinaryWrite(streamID string, payload []byte) {
 			return
 		}
 		if errors.Is(err, errClientBacklog) {
-			s.server.logger.Warn("client backlog exceeded", "agent", s.id, "stream", streamID)
+			s.server.logger.Debug("client backlog exceeded", "agent", s.id, "stream", streamID)
 		} else {
 			s.server.logger.Debug("enqueue to client failed", "agent", s.id, "stream", streamID, "error", err)
 		}

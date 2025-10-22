@@ -11,20 +11,21 @@ import (
 )
 
 type relayOptions struct {
-	proxyListen   string
-	secureListen  string
-	socksListen   string
-	agentConfig   string
-	aclPatterns   []string
-	maxFrame      int
-	maxInFlight   int
-	wsIdle        time.Duration
-	dialTimeoutMs int
-	acmeHosts     []string
-	acmeEmail     string
-	acmeCache     string
-	acmeHTTPAddr  string
-	streamIDMode  string
+	proxyListen      string
+	secureListen     string
+	socksListen      string
+	agentConfig      string
+	aclPatterns      []string
+	maxFrame         int
+	maxInFlight      int
+	streamQueueDepth int
+	wsIdle           time.Duration
+	dialTimeoutMs    int
+	acmeHosts        []string
+	acmeEmail        string
+	acmeCache        string
+	acmeHTTPAddr     string
+	streamIDMode     string
 }
 
 type relayCounters struct {
@@ -36,15 +37,16 @@ type relayCounters struct {
 
 func NewCommand(globals *runtime.Options) *cobra.Command {
 	opts := &relayOptions{
-		proxyListen:   ":8080",
-		secureListen:  ":8443",
-		socksListen:   "",
-		maxFrame:      32 * 1024,
-		maxInFlight:   256 * 1024,
-		wsIdle:        45 * time.Second,
-		dialTimeoutMs: 10000,
-		acmeHTTPAddr:  "",
-		streamIDMode:  "uuid",
+		proxyListen:      ":8080",
+		secureListen:     ":8443",
+		socksListen:      "",
+		maxFrame:         32 * 1024,
+		maxInFlight:      256 * 1024,
+		streamQueueDepth: 128,
+		wsIdle:           45 * time.Second,
+		dialTimeoutMs:    10000,
+		acmeHTTPAddr:     "",
+		streamIDMode:     "uuid",
 	}
 
 	cmd := &cobra.Command{
@@ -75,6 +77,7 @@ func NewCommand(globals *runtime.Options) *cobra.Command {
 	cmd.Flags().StringSliceVar(&opts.aclPatterns, "acl-allow", nil, "regex ACLs for allowed host:port destinations (repeatable)")
 	cmd.Flags().IntVar(&opts.maxFrame, "max-frame", opts.maxFrame, "maximum payload size per frame in bytes")
 	cmd.Flags().IntVar(&opts.maxInFlight, "max-inflight", opts.maxInFlight, "maximum queued bytes per stream when sending to clients (0 disables)")
+	cmd.Flags().IntVar(&opts.streamQueueDepth, "stream-queue-depth", opts.streamQueueDepth, "depth of relay per-stream client write queues")
 	cmd.Flags().DurationVar(&opts.wsIdle, "ws-idle", opts.wsIdle, "maximum idle time on agent websocket before disconnect")
 	cmd.Flags().IntVar(&opts.dialTimeoutMs, "dial-timeout-ms", opts.dialTimeoutMs, "timeout in milliseconds for agent dial acknowledgment (0 disables)")
 	cmd.Flags().StringSliceVar(&opts.acmeHosts, "acme-host", nil, "hostnames for Let's Encrypt certificates (repeatable)")

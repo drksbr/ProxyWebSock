@@ -121,7 +121,7 @@ func (s *relayServer) handleSocksConn(conn net.Conn) {
 	}
 
 	streamID := s.nextStreamID()
-	stream := newRelayStream(streamID, session, streamProtoSOCKS5, conn, nil, host, port)
+	stream := newRelayStream(streamID, session, streamProtoSOCKS5, conn, nil, host, port, s.opts.streamQueueDepth)
 	if err := session.registerStream(stream); err != nil {
 		logger.Warn("register stream failed", "stream", streamID, "error", err)
 		_ = writeSocksReply(conn, 0x01)

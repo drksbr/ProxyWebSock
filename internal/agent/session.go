@@ -352,7 +352,7 @@ func (s *session) handleDial(f protocol.Frame) {
 		return
 	}
 
-	stream := newAgentStream(f.StreamID, conn, s.agent.opts.maxInFlight, s.logger)
+	stream := newAgentStream(f.StreamID, conn, s.agent.opts.maxInFlight, s.agent.opts.queueDepth, s.logger)
 	if err := s.storeStream(stream); err != nil {
 		s.logger.Warn("stream register failed", "stream", f.StreamID, "error", err)
 		conn.Close()

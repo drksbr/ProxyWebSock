@@ -28,7 +28,32 @@ type agentStream struct {
 	closeOnce     sync.Once
 }
 
-func newAgentStream(id string, conn net.Conn, maxInFlight int, logger *slog.Logger) *agentStream {
+const maxAgentPooledBuffer = 512 * 1024
+
+var agentQueueBufferPool = sync.Pool{
+	New: func() any {
+		return make([]byte, 0, 32*1024)
+	},
+}
+
+func borrowAgentBuffer(size int) []byte {
+	buf := agentQueueBufferPool.Get().([]byte)
+	if cap(buf) < size {
+		return make([]byte, size)
+	}
+	return buf[:size]
+}
+
+func releaseAgentBuffer(buf []byte) {
+	if buf == nil {
+		return
+	}
+	if cap(buf) <= maxAgentPooledBuffer {
+		agentQueueBufferPool.Put(buf[:0])
+	}
+}
+
+func newAgentStream(id string, conn net.Conn, maxInFlight, queueDepth int, logger *slog.Logger) *agentStream {
 	streamLogger := logger
 	if streamLogger != nil {
 		streamLogger = streamLogger.With("stream", id)
@@ -38,7 +63,7 @@ func newAgentStream(id string, conn net.Conn, maxInFlight int, logger *slog.Logg
 		conn:          conn,
 		outboundLimit: bytelimiter.New(maxInFlight),
 		inboundLimit:  bytelimiter.New(maxInFlight),
-		writeQueue:    make(chan streamWriteRequest, 64),
+		writeQueue:    make(chan streamWriteRequest, queueDepth),
 		logger:        streamLogger,
 		closed:        make(chan struct{}),
 	}
@@ -67,13 +92,20 @@ func (s *agentStream) enqueueInbound(data []byte) error {
 		s.close()
 		return errStreamClosed
 	}
+	buf := borrowAgentBuffer(size)
+	copy(buf, data)
+	req := streamWriteRequest{
+		data: buf,
+		size: size,
+	}
 	select {
-	case s.writeQueue <- streamWriteRequest{data: data, size: size}:
+	case s.writeQueue <- req:
 		return nil
 	case <-s.closed:
 		if s.inboundLimit != nil {
 			s.inboundLimit.Release(size)
 		}
+		releaseAgentBuffer(buf)
 		return errStreamClosed
 	default:
 		if s.inboundLimit != nil {
@@ -82,6 +114,7 @@ func (s *agentStream) enqueueInbound(data []byte) error {
 		if s.logger != nil {
 			s.logger.Warn("inbound write queue overflow, closing stream")
 		}
+		releaseAgentBuffer(buf)
 		s.close()
 		return errStreamClosed
 	}
@@ -98,6 +131,7 @@ func (s *agentStream) writerLoop() {
 				if s.inboundLimit != nil && req.size > 0 {
 					s.inboundLimit.Release(req.size)
 				}
+				releaseAgentBuffer(req.data)
 				continue
 			}
 			total := 0
@@ -107,6 +141,7 @@ func (s *agentStream) writerLoop() {
 					if s.logger != nil {
 						s.logger.Warn("stream write failed", "error", err)
 					}
+					releaseAgentBuffer(req.data)
 					s.close()
 					break
 				}
@@ -115,6 +150,7 @@ func (s *agentStream) writerLoop() {
 			if s.inboundLimit != nil && req.size > 0 {
 				s.inboundLimit.Release(req.size)
 			}
+			releaseAgentBuffer(req.data)
 		case <-s.closed:
 			return
 		}

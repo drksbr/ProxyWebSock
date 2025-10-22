@@ -44,6 +44,31 @@ type relayWriteRequest struct {
 	size int
 }
 
+const maxRelayPooledBuffer = 512 * 1024
+
+var relayQueueBufferPool = sync.Pool{
+	New: func() any {
+		return make([]byte, 0, 32*1024)
+	},
+}
+
+func borrowRelayBuffer(size int) []byte {
+	buf := relayQueueBufferPool.Get().([]byte)
+	if cap(buf) < size {
+		return make([]byte, size)
+	}
+	return buf[:size]
+}
+
+func releaseRelayBuffer(buf []byte) {
+	if buf == nil {
+		return
+	}
+	if cap(buf) <= maxRelayPooledBuffer {
+		relayQueueBufferPool.Put(buf[:0])
+	}
+}
+
 type relayStream struct {
 	id         string
 	agent      *relayAgentSession
@@ -68,7 +93,7 @@ type relayStream struct {
 	logger             *slog.Logger
 }
 
-func newRelayStream(id string, agent *relayAgentSession, proto streamProtocol, client net.Conn, bufrw *bufio.ReadWriter, host string, port int) *relayStream {
+func newRelayStream(id string, agent *relayAgentSession, proto streamProtocol, client net.Conn, bufrw *bufio.ReadWriter, host string, port int, queueDepth int) *relayStream {
 	streamLogger := agent.server.logger.With("agent", agent.id, "stream", id)
 	rs := &relayStream{
 		id:           id,
@@ -82,7 +107,7 @@ func newRelayStream(id string, agent *relayAgentSession, proto streamProtocol, c
 		closing:      make(chan struct{}),
 		readyCh:      make(chan error, 1),
 		handshake:    make(chan struct{}),
-		writeQueue:   make(chan relayWriteRequest, 64),
+		writeQueue:   make(chan relayWriteRequest, queueDepth),
 		backlogLimit: bytelimiter.New(agent.server.opts.maxInFlight),
 		logger:       streamLogger,
 	}
@@ -104,16 +129,15 @@ func (s *relayStream) writerLoop() {
 				return
 			}
 			if req.size == 0 {
+				releaseRelayBuffer(req.data)
 				continue
 			}
 			total := 0
+			var writeErr error
 			for total < len(req.data) {
 				n, err := s.client.Write(req.data[total:])
 				if err != nil {
-					if s.logger != nil {
-						s.logger.Debug("client write failed", "error", err)
-					}
-					s.closeFromRelay(err)
+					writeErr = err
 					break
 				}
 				total += n
@@ -123,12 +147,19 @@ func (s *relayStream) writerLoop() {
 				s.agent.server.metrics.bytesDownstream.Add(float64(total))
 				s.agent.server.stats.bytesDown.Add(int64(total))
 			}
+			if s.backlogLimit != nil {
+				s.backlogLimit.Release(req.size)
+			}
+			releaseRelayBuffer(req.data)
 			newPending := s.pendingClientBytes.Add(-int64(req.size))
 			if newPending < 0 {
 				s.pendingClientBytes.Store(0)
 			}
-			if s.backlogLimit != nil {
-				s.backlogLimit.Release(req.size)
+			if writeErr != nil {
+				if s.logger != nil {
+					s.logger.Debug("client write failed", "error", writeErr)
+				}
+				s.closeFromRelay(writeErr)
 			}
 		case <-s.closing:
 			return
@@ -243,8 +274,10 @@ func (s *relayStream) writeToClient(data []byte) error {
 	if s.backlogLimit != nil && !s.backlogLimit.TryAcquire(size) {
 		return errClientBacklog
 	}
+	buf := borrowRelayBuffer(size)
+	copy(buf, data)
 	req := relayWriteRequest{
-		data: data,
+		data: buf,
 		size: size,
 	}
 	select {
@@ -255,11 +288,13 @@ func (s *relayStream) writeToClient(data []byte) error {
 		if s.backlogLimit != nil {
 			s.backlogLimit.Release(size)
 		}
+		releaseRelayBuffer(buf)
 		return errClientStreamClosed
 	default:
 		if s.backlogLimit != nil {
 			s.backlogLimit.Release(size)
 		}
+		releaseRelayBuffer(buf)
 		return errClientBacklog
 	}
 }

@@ -104,7 +104,7 @@ func (s *relayServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	streamID := s.nextStreamID()
-	stream := newRelayStream(streamID, session, streamProtoHTTP, clientConn, buf, host, port)
+	stream := newRelayStream(streamID, session, streamProtoHTTP, clientConn, buf, host, port, s.opts.streamQueueDepth)
 	if err := session.registerStream(stream); err != nil {
 		writeProxyError(buf, fmt.Sprintf("stream register failed: %v", err))
 		return

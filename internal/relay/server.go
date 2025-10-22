@@ -87,6 +87,9 @@ func newRelayServer(logger *slog.Logger, opts *relayOptions) (*relayServer, erro
 	if opts.maxInFlight < 0 {
 		return nil, errors.New("--max-inflight cannot be negative")
 	}
+	if opts.streamQueueDepth <= 0 {
+		return nil, errors.New("--stream-queue-depth must be positive")
+	}
 
 	if len(opts.acmeHosts) == 0 {
 		return nil, errors.New("at least one --acme-host is required for Let's Encrypt")

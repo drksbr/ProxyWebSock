@@ -22,6 +22,7 @@ type options struct {
 	writeBuffer   int
 	maxFrame      int
 	maxInFlight   int
+	queueDepth    int
 	reconnectMin  time.Duration
 	reconnectMax  time.Duration
 	relayParsed   *url.URL
@@ -35,6 +36,7 @@ func NewCommand(globals *runtime.Options) *cobra.Command {
 		writeBuffer:   64 * 1024,
 		maxFrame:      32 * 1024,
 		maxInFlight:   256 * 1024,
+		queueDepth:    128,
 		reconnectMin:  2 * time.Second,
 		reconnectMax:  30 * time.Second,
 	}
@@ -68,6 +70,7 @@ func NewCommand(globals *runtime.Options) *cobra.Command {
 	cmd.Flags().IntVar(&opts.writeBuffer, "write-buf", opts.writeBuffer, "websocket write buffer size")
 	cmd.Flags().IntVar(&opts.maxFrame, "max-frame", opts.maxFrame, "maximum payload size per frame in bytes")
 	cmd.Flags().IntVar(&opts.maxInFlight, "max-inflight", opts.maxInFlight, "maximum unacknowledged bytes per stream (0 disables)")
+	cmd.Flags().IntVar(&opts.queueDepth, "stream-queue-depth", opts.queueDepth, "depth of per-stream inbound queue buffers")
 
 	return cmd
 }
@@ -96,6 +99,9 @@ func (o *options) validate() error {
 	}
 	if o.readBuffer <= 0 || o.writeBuffer <= 0 {
 		return errors.New("buffers must be positive")
+	}
+	if o.queueDepth <= 0 {
+		return errors.New("--stream-queue-depth must be positive")
 	}
 	if o.reconnectMin <= 0 {
 		o.reconnectMin = 2 * time.Second
