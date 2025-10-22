@@ -8,8 +8,8 @@ BINARY := $(BIN_DIR)/intratun
 PID_FILE := $(BIN_DIR)/intratun.pid
 LOG_FILE := $(BIN_DIR)/intratun.log
 
-RELAY_ARGS := relay --agent-config ./config/agents.example.yaml --stream-id-mode=cuid --proxy-listen=:8080 --secure-listen=:443 --socks-listen=:1080 --acl-allow='^.*:443$$' --acme-host=relay.neurocirurgiahgrs.com.br --acme-email=admin@ncr.com.br --acme-cache=/var/lib/intratun/acme --acme-http=:80
-AGENT_ARGS := agent --relay=wss://relay.neurocirurgiahgrs.com.br/tunnel --id=agente01 --token=troque-esta-senha --dial-timeout-ms=5000 --max-frame=32768 --read-buf=65536 --write-buf=65536
+RELAY_ARGS := relay --agent-config ./config/agents.example.yaml --stream-id-mode=cuid --proxy-listen=:8080 --secure-listen=:443 --socks-listen=:1080 --acl-allow='^.*:443$$' --acme-host=relay.neurocirurgiahgrs.com.br --acme-email=admin@ncr.com.br --acme-cache=/var/lib/intratun/acme --acme-http=:80 --log-level=error
+AGENT_ARGS := agent --relay=wss://relay.neurocirurgiahgrs.com.br/tunnel --id=agente01 --token=troque-esta-senha --dial-timeout-ms=5000 --max-frame=32768 --read-buf=65536 --write-buf=65536 --log-level=error
 
 PM ?= bun
 VERSION_SCRIPT := $(CURDIR)/scripts/sync-version.mjs
