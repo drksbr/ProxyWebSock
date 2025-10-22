@@ -71,6 +71,9 @@ type relayAgentSession struct {
 	heartbeatPending     int
 	agentControlQueue    int
 	agentDataQueue       int
+	agentCPU             float64
+	agentRSS             uint64
+	agentGoroutines      int
 
 	errorMu     sync.Mutex
 	errorCount  int64
@@ -595,6 +598,9 @@ func (s *relayAgentSession) updateHeartbeatFromAgent(payload *protocol.Heartbeat
 		s.heartbeatPending = payload.Stats.Pending
 		s.agentControlQueue = payload.Stats.ControlQueueDepth
 		s.agentDataQueue = payload.Stats.DataQueueDepth
+		s.agentCPU = payload.Stats.CPUPercent
+		s.agentRSS = payload.Stats.RSSBytes
+		s.agentGoroutines = payload.Stats.Goroutines
 		if payload.Stats.LastError != "" {
 			s.lastHeartbeatError = payload.Stats.LastError
 			if payload.Stats.LastErrorAt != 0 {
@@ -612,6 +618,9 @@ func (s *relayAgentSession) updateHeartbeatFromAgent(payload *protocol.Heartbeat
 		s.heartbeatPending = 0
 		s.agentControlQueue = 0
 		s.agentDataQueue = 0
+		s.agentCPU = 0
+		s.agentRSS = 0
+		s.agentGoroutines = 0
 	}
 	s.heartbeatMu.Unlock()
 }
@@ -674,6 +683,9 @@ func (s *relayAgentSession) snapshot() statusAgent {
 	pending := s.heartbeatPending
 	agentControlQueue := s.agentControlQueue
 	agentDataQueue := s.agentDataQueue
+	cpu := s.agentCPU
+	rss := s.agentRSS
+	goroutines := s.agentGoroutines
 	s.heartbeatMu.Unlock()
 
 	if lastHeartbeat.IsZero() {
@@ -696,6 +708,15 @@ func (s *relayAgentSession) snapshot() statusAgent {
 	}
 	if pending > 0 {
 		agent.HeartbeatPending = pending
+	}
+	if cpu > 0 {
+		agent.AgentCPUPercent = cpu
+	}
+	if rss > 0 {
+		agent.AgentRSSBytes = rss
+	}
+	if goroutines > 0 {
+		agent.AgentGoroutines = goroutines
 	}
 
 	s.errorMu.Lock()

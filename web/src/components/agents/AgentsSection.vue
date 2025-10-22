@@ -8,6 +8,7 @@ import {
   formatCount,
   formatMillis,
   formatRelative,
+  formatPercent,
 } from "../../utils/format";
 
 const props = defineProps<{
@@ -310,7 +311,7 @@ function agentCardClasses(agent: StatusAgent): string {
           </div>
 
           <div
-            class="grid gap-2 text-sm text-slate-300 md:grid-cols-2 lg:grid-cols-3"
+            class="grid gap-2 text-sm text-slate-300 md:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6"
           >
             <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
               <div class="text-xs uppercase tracking-wide text-slate-500">
@@ -338,6 +339,18 @@ function agentCardClasses(agent: StatusAgent): string {
             </div>
             <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
               <div class="text-xs uppercase tracking-wide text-slate-500">
+                Atraso envio HB
+              </div>
+              <div>{{ formatMillis(agent.heartbeatSendDelayMillis) }}</div>
+            </div>
+            <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
+              <div class="text-xs uppercase tracking-wide text-slate-500">
+                HB pendentes
+              </div>
+              <div>{{ formatCount(agent.heartbeatPending ?? 0) }}</div>
+            </div>
+            <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
+              <div class="text-xs uppercase tracking-wide text-slate-500">
                 Falhas consecutivas
               </div>
               <div>{{ agent.heartbeatFailures ?? 0 }}</div>
@@ -361,6 +374,76 @@ function agentCardClasses(agent: StatusAgent): string {
                 </div>
               </div>
               <div v-else class="text-slate-500">Nenhum</div>
+            </div>
+          </div>
+
+          <div
+            class="grid gap-2 text-sm text-slate-300 md:grid-cols-2 lg:grid-cols-4"
+          >
+            <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
+              <div class="text-xs uppercase tracking-wide text-slate-500">
+                Fila controle (relay)
+              </div>
+              <div>{{ formatCount(agent.relayControlQueueDepth ?? 0) }}</div>
+            </div>
+            <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
+              <div class="text-xs uppercase tracking-wide text-slate-500">
+                Fila dados (relay)
+              </div>
+              <div>{{ formatCount(agent.relayDataQueueDepth ?? 0) }}</div>
+            </div>
+            <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
+              <div class="text-xs uppercase tracking-wide text-slate-500">
+                Fila controle (agente)
+              </div>
+              <div>{{ formatCount(agent.agentControlQueueDepth ?? 0) }}</div>
+            </div>
+            <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
+              <div class="text-xs uppercase tracking-wide text-slate-500">
+                Fila dados (agente)
+              </div>
+              <div>{{ formatCount(agent.agentDataQueueDepth ?? 0) }}</div>
+            </div>
+          </div>
+
+          <div
+            class="grid gap-2 text-sm text-slate-300 md:grid-cols-2 lg:grid-cols-3"
+          >
+            <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
+              <div class="text-xs uppercase tracking-wide text-slate-500">
+                CPU do agente
+              </div>
+              <div>
+                {{
+                  agent.agentCpuPercent != null
+                    ? formatPercent(agent.agentCpuPercent)
+                    : "-"
+                }}
+              </div>
+            </div>
+            <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
+              <div class="text-xs uppercase tracking-wide text-slate-500">
+                Memória (RSS)
+              </div>
+              <div>
+                {{
+                  agent.agentRssBytes && agent.agentRssBytes > 0
+                    ? formatBytes(agent.agentRssBytes)
+                    : "-"
+                }}
+              </div>
+            </div>
+            <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
+              <div class="text-xs uppercase tracking-wide text-slate-500">
+                Goroutines
+              </div>
+              <div>
+                {{
+                  agent.agentGoroutines != null
+                    ? formatCount(agent.agentGoroutines)
+                    : "-"
+                }}
+              </div>
             </div>
           </div>
 

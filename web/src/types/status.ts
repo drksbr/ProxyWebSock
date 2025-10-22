@@ -29,13 +29,22 @@ export type StatusAgent = {
   lastHeartbeatAt?: string;
   latencyMillis?: number;
   jitterMillis?: number;
+  heartbeatSendDelayMillis?: number;
   heartbeatSeq?: number;
   heartbeatFailures?: number;
+  heartbeatPending?: number;
   errorCount?: number;
   lastError?: string;
   lastErrorAt?: string;
+  relayControlQueueDepth?: number;
+  relayDataQueueDepth?: number;
+  agentControlQueueDepth?: number;
+  agentDataQueueDepth?: number;
+  agentCpuPercent?: number;
+  agentRssBytes?: number;
+  agentGoroutines?: number;
   acl?: string[];
-  streams: StatusStream[];
+  streams?: StatusStream[];
   autoConfig?: string;
 };
 

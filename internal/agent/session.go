@@ -8,10 +8,13 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
+	"runtime"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/shirou/gopsutil/v4/process"
 
 	"github.com/drksbr/ProxyWebSock/internal/protocol"
 )
@@ -23,6 +26,8 @@ type outboundMessage struct {
 	binary  []byte
 	onWrite func(success bool)
 }
+
+const resourceSampleInterval = 10 * time.Second
 
 type session struct {
 	agent *agent
@@ -38,9 +43,11 @@ type session struct {
 	writerDone    chan struct{}
 	writerStarted bool
 	writerClose   sync.Once
+	proc          *process.Process
 }
 
 func newSession(agent *agent, conn *websocket.Conn) *session {
+	proc, _ := process.NewProcess(int32(os.Getpid()))
 	return &session{
 		agent:        agent,
 		conn:         conn,
@@ -50,6 +57,7 @@ func newSession(agent *agent, conn *websocket.Conn) *session {
 		controlQueue: make(chan outboundMessage, 128),
 		dataQueue:    make(chan outboundMessage, 256),
 		writerDone:   make(chan struct{}),
+		proc:         proc,
 	}
 }
 
@@ -233,6 +241,7 @@ func (s *session) run(ctx context.Context) error {
 	hbCtx, hbCancel := context.WithCancel(ctx)
 	defer hbCancel()
 	go s.heartbeatLoop(hbCtx)
+	go s.resourceLoop(hbCtx)
 
 	for {
 		select {
@@ -449,6 +458,40 @@ func (s *session) heartbeatLoop(ctx context.Context) {
 			s.sendHeartbeat()
 		}
 	}
+}
+
+func (s *session) resourceLoop(ctx context.Context) {
+	if s.proc == nil {
+		return
+	}
+	ticker := time.NewTicker(resourceSampleInterval)
+	defer ticker.Stop()
+	s.collectResources(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.collectResources(ctx)
+		}
+	}
+}
+
+func (s *session) collectResources(ctx context.Context) {
+	if s.proc == nil {
+		return
+	}
+	cpuPercent, err := s.proc.PercentWithContext(ctx, 0)
+	if err != nil {
+		cpuPercent = 0
+	}
+	mem, err := s.proc.MemoryInfoWithContext(ctx)
+	var rss uint64
+	if err == nil && mem != nil {
+		rss = mem.RSS
+	}
+	goroutines := runtime.NumGoroutine()
+	s.heartbeat.updateResources(cpuPercent, rss, goroutines)
 }
 
 func (s *session) sendHeartbeat() {

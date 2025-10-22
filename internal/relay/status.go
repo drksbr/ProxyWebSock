@@ -57,6 +57,9 @@ type statusAgent struct {
 	RelayDataQueueDepth      int            `json:"relayDataQueueDepth,omitempty"`
 	AgentControlQueueDepth   int            `json:"agentControlQueueDepth,omitempty"`
 	AgentDataQueueDepth      int            `json:"agentDataQueueDepth,omitempty"`
+	AgentCPUPercent          float64        `json:"agentCpuPercent,omitempty"`
+	AgentRSSBytes            uint64         `json:"agentRssBytes,omitempty"`
+	AgentGoroutines          int            `json:"agentGoroutines,omitempty"`
 	Streams                  []statusStream `json:"streams"`
 	AutoConfig               string         `json:"autoConfig,omitempty"`
 }
