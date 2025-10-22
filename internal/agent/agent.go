@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -20,6 +21,11 @@ import (
 	"github.com/drksbr/ProxyWebSock/internal/protocol"
 	"github.com/drksbr/ProxyWebSock/internal/runtime"
 	"github.com/drksbr/ProxyWebSock/internal/version"
+)
+
+const (
+	heartbeatInterval = 10 * time.Second
+	heartbeatTimeout  = 25 * time.Second
 )
 
 type options struct {
@@ -207,14 +213,17 @@ type session struct {
 
 	writeMu sync.Mutex
 	logger  *slog.Logger
+
+	heartbeat *heartbeatState
 }
 
 func newSession(agent *agent, conn *websocket.Conn) *session {
 	return &session{
-		agent:   agent,
-		conn:    conn,
-		streams: make(map[string]*agentStream),
-		logger:  agent.logger.With("session", time.Now().UnixNano()),
+		agent:     agent,
+		conn:      conn,
+		streams:   make(map[string]*agentStream),
+		logger:    agent.logger.With("session", time.Now().UnixNano()),
+		heartbeat: newHeartbeatState(),
 	}
 }
 
@@ -231,8 +240,9 @@ func (s *session) run(ctx context.Context) error {
 		readErr <- s.readLoop()
 	}()
 
-	pingTicker := time.NewTicker(20 * time.Second)
-	defer pingTicker.Stop()
+	hbCtx, hbCancel := context.WithCancel(ctx)
+	defer hbCancel()
+	go s.heartbeatLoop(hbCtx)
 
 	for {
 		select {
@@ -240,10 +250,6 @@ func (s *session) run(ctx context.Context) error {
 			return ctx.Err()
 		case err := <-readErr:
 			return err
-		case <-pingTicker.C:
-			if err := s.sendControl(websocket.PingMessage); err != nil {
-				return err
-			}
 		}
 	}
 }
@@ -262,7 +268,7 @@ func (s *session) register() error {
 	if err := s.conn.SetWriteDeadline(time.Time{}); err != nil {
 		return err
 	}
-	readDeadline := 30 * time.Second
+	readDeadline := heartbeatTimeout
 	if err := s.conn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
 		return err
 	}
@@ -279,6 +285,9 @@ func (s *session) readLoop() error {
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
+			return err
+		}
+		if err := s.conn.SetReadDeadline(time.Now().Add(heartbeatTimeout)); err != nil {
 			return err
 		}
 
@@ -309,6 +318,8 @@ func (s *session) readLoop() error {
 				s.handleClose(f)
 			case protocol.FrameTypeError:
 				s.handleRelayError(f)
+			case protocol.FrameTypeHeartbeat:
+				s.handleHeartbeat(f)
 			default:
 				s.logger.Warn("unknown frame type", "type", f.Type)
 			}
@@ -333,6 +344,7 @@ func (s *session) handleDial(f protocol.Frame) {
 	conn, err := net.DialTimeout("tcp", address, timeout)
 	if err != nil {
 		s.logger.Warn("dial failed", "stream", f.StreamID, "target", address, "error", err)
+		s.heartbeat.recordError(err.Error())
 		_ = s.sendFrame(&protocol.Frame{
 			Type:     protocol.FrameTypeError,
 			StreamID: f.StreamID,
@@ -345,6 +357,7 @@ func (s *session) handleDial(f protocol.Frame) {
 	if err := s.storeStream(stream); err != nil {
 		s.logger.Warn("stream register failed", "stream", f.StreamID, "error", err)
 		conn.Close()
+		s.heartbeat.recordError(err.Error())
 		_ = s.sendFrame(&protocol.Frame{
 			Type:     protocol.FrameTypeError,
 			StreamID: f.StreamID,
@@ -397,7 +410,208 @@ func (s *session) handleRelayError(f protocol.Frame) {
 	}
 	if f.Error != "" {
 		s.logger.Warn("relay reported error", "stream", f.StreamID, "error", f.Error)
+		s.heartbeat.recordError(f.Error)
 	}
+}
+
+func (s *session) handleHeartbeat(f protocol.Frame) {
+	payload := f.Heartbeat
+	if payload == nil {
+		s.logger.Warn("heartbeat frame missing payload")
+		return
+	}
+
+	switch payload.Mode {
+	case protocol.HeartbeatModePong:
+		ackTime := time.Now()
+		if payload.AckAt != 0 {
+			ackTime = time.Unix(0, payload.AckAt)
+		}
+		s.heartbeat.handleAck(payload.Sequence, ackTime)
+		_ = s.conn.SetReadDeadline(time.Now().Add(heartbeatTimeout))
+	case protocol.HeartbeatModePing:
+		reply := &protocol.Frame{
+			Type: protocol.FrameTypeHeartbeat,
+			Heartbeat: &protocol.HeartbeatPayload{
+				Sequence: payload.Sequence,
+				SentAt:   payload.SentAt,
+				AckAt:    time.Now().UnixNano(),
+				Mode:     protocol.HeartbeatModePong,
+			},
+		}
+		if err := s.sendFrame(reply); err != nil {
+			s.logger.Debug("heartbeat pong failed", "error", err)
+			s.heartbeat.markSendFailure()
+			return
+		}
+	default:
+		s.logger.Warn("heartbeat frame with unknown mode", "mode", payload.Mode)
+	}
+}
+
+func (s *session) heartbeatLoop(ctx context.Context) {
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+
+	// send first heartbeat immediately to prime the watchdog
+	s.sendHeartbeat()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.sendHeartbeat()
+		}
+	}
+}
+
+func (s *session) sendHeartbeat() {
+	now := time.Now()
+	payload := s.heartbeat.nextPayload(now)
+	if payload == nil {
+		return
+	}
+	frame := &protocol.Frame{
+		Type:      protocol.FrameTypeHeartbeat,
+		Heartbeat: payload,
+	}
+	if err := s.sendFrame(frame); err != nil {
+		s.logger.Debug("heartbeat send failed", "error", err)
+		s.heartbeat.markSendFailure()
+		return
+	}
+	s.heartbeat.markSent(payload.Sequence, now)
+	s.heartbeat.expirePending(now)
+}
+
+type heartbeatState struct {
+	seq atomic.Uint64
+
+	mu                  sync.Mutex
+	pending             map[uint64]time.Time
+	lastRTT             time.Duration
+	jitter              time.Duration
+	consecutiveFailures int
+	lastAck             time.Time
+	lastSent            time.Time
+	lastError           string
+	lastErrorAt         time.Time
+}
+
+func newHeartbeatState() *heartbeatState {
+	return &heartbeatState{
+		pending: make(map[uint64]time.Time),
+	}
+}
+
+func (h *heartbeatState) nextPayload(now time.Time) *protocol.HeartbeatPayload {
+	seq := h.seq.Add(1)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	payload := &protocol.HeartbeatPayload{
+		Sequence: seq,
+		SentAt:   now.UnixNano(),
+		Mode:     protocol.HeartbeatModePing,
+	}
+	if stats := h.statsSnapshotLocked(); stats != nil {
+		payload.Stats = stats
+	}
+	return payload
+}
+
+func (h *heartbeatState) markSent(seq uint64, sentAt time.Time) {
+	h.mu.Lock()
+	h.pending[seq] = sentAt
+	h.lastSent = sentAt
+	h.mu.Unlock()
+}
+
+func (h *heartbeatState) markSendFailure() {
+	h.mu.Lock()
+	h.consecutiveFailures++
+	h.mu.Unlock()
+}
+
+func (h *heartbeatState) handleAck(seq uint64, ackTime time.Time) {
+	h.mu.Lock()
+	sentAt, ok := h.pending[seq]
+	if ok {
+		delete(h.pending, seq)
+	}
+	if !ok {
+		h.mu.Unlock()
+		return
+	}
+	rtt := ackTime.Sub(sentAt)
+	if rtt < 0 {
+		rtt = time.Since(sentAt)
+	}
+	if rtt < 0 {
+		rtt = 0
+	}
+
+	if h.lastRTT == 0 {
+		h.lastRTT = rtt
+	} else {
+		delta := rtt - h.lastRTT
+		if delta < 0 {
+			delta = -delta
+		}
+		h.jitter = (3*h.jitter + delta) / 4
+		h.lastRTT = (3*h.lastRTT + rtt) / 4
+	}
+
+	h.consecutiveFailures = 0
+	h.lastAck = ackTime
+	h.mu.Unlock()
+}
+
+func (h *heartbeatState) expirePending(now time.Time) {
+	h.mu.Lock()
+	for seq, sentAt := range h.pending {
+		if now.Sub(sentAt) > heartbeatTimeout {
+			delete(h.pending, seq)
+			h.consecutiveFailures++
+		}
+	}
+	h.mu.Unlock()
+}
+
+func (h *heartbeatState) recordError(message string) {
+	if message == "" {
+		return
+	}
+	h.mu.Lock()
+	h.lastError = message
+	h.lastErrorAt = time.Now()
+	h.mu.Unlock()
+}
+
+func (h *heartbeatState) statsSnapshotLocked() *protocol.HeartbeatStats {
+	if h.lastRTT == 0 && h.jitter == 0 && h.consecutiveFailures == 0 && h.lastError == "" {
+		return nil
+	}
+	stats := &protocol.HeartbeatStats{
+		RTTMillis:           durationToMillis(h.lastRTT),
+		JitterMillis:        durationToMillis(h.jitter),
+		ConsecutiveFailures: h.consecutiveFailures,
+	}
+	if h.lastError != "" {
+		stats.LastError = h.lastError
+		if !h.lastErrorAt.IsZero() {
+			stats.LastErrorAt = h.lastErrorAt.UnixNano()
+		}
+	}
+	return stats
+}
+
+func durationToMillis(d time.Duration) float64 {
+	if d <= 0 {
+		return 0
+	}
+	return float64(d) / float64(time.Millisecond)
 }
 
 func (s *session) handleBinaryWrite(streamID string, payload []byte) {
@@ -415,6 +629,7 @@ func (s *session) handleBinaryWrite(streamID string, payload []byte) {
 		n, err := stream.conn.Write(payload[total:])
 		if err != nil {
 			s.logger.Warn("stream write failed", "stream", streamID, "error", err)
+			s.heartbeat.recordError(err.Error())
 			stream.close()
 			_ = s.sendFrame(&protocol.Frame{
 				Type:     protocol.FrameTypeError,
@@ -455,12 +670,6 @@ func (s *session) sendBinary(streamID string, payload []byte) error {
 		err = s.conn.SetWriteDeadline(time.Time{})
 	}
 	return err
-}
-
-func (s *session) sendControl(messageType int) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	return s.conn.WriteControl(messageType, nil, time.Now().Add(10*time.Second))
 }
 
 func (s *session) storeStream(stream *agentStream) error {
@@ -526,6 +735,7 @@ func (s *session) pipeOutbound(stream *agentStream) {
 				return
 			}
 			s.logger.Warn("stream read failed", "stream", stream.id, "error", err)
+			s.heartbeat.recordError(err.Error())
 			_ = s.sendFrame(&protocol.Frame{
 				Type:     protocol.FrameTypeError,
 				StreamID: stream.id,

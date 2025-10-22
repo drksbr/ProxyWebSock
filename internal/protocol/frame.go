@@ -13,6 +13,7 @@ const (
 	FrameTypeWrite    FrameType = "write"
 	FrameTypeClose    FrameType = "close"
 	FrameTypeError    FrameType = "err"
+	FrameTypeHeartbeat FrameType = "heartbeat"
 )
 
 type Frame struct {
@@ -24,6 +25,7 @@ type Frame struct {
 	Port     int       `json:"port,omitempty"`
 	Payload  string    `json:"payload,omitempty"`
 	Error    string    `json:"error,omitempty"`
+	Heartbeat *HeartbeatPayload `json:"heartbeat,omitempty"`
 }
 
 func EncodePayload(data []byte) string {
@@ -69,4 +71,27 @@ func DecodeBinaryFrame(data []byte) (string, []byte, error) {
 	}
 	streamID := string(data[1 : 1+idLen])
 	return streamID, data[1+idLen:], nil
+}
+
+type HeartbeatMode string
+
+const (
+	HeartbeatModePing HeartbeatMode = "ping"
+	HeartbeatModePong HeartbeatMode = "pong"
+)
+
+type HeartbeatStats struct {
+	RTTMillis           float64 `json:"rttMillis,omitempty"`
+	JitterMillis        float64 `json:"jitterMillis,omitempty"`
+	ConsecutiveFailures int     `json:"consecutiveFailures,omitempty"`
+	LastError           string  `json:"lastError,omitempty"`
+	LastErrorAt         int64   `json:"lastErrorAt,omitempty"`
+}
+
+type HeartbeatPayload struct {
+	Sequence  uint64        `json:"seq"`
+	SentAt    int64         `json:"sentAt"`
+	AckAt     int64         `json:"ackAt,omitempty"`
+	Mode      HeartbeatMode `json:"mode,omitempty"`
+	Stats     *HeartbeatStats `json:"stats,omitempty"`
 }

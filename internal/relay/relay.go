@@ -41,6 +41,11 @@ import (
 //go:embed dist/index.html dist/assets/* dist/logo.svg dist/logo-white.svg
 var embeddedDashboard embed.FS
 
+const (
+	heartbeatExpectedInterval = 10 * time.Second
+	heartbeatDegradedAfter    = 3 * heartbeatExpectedInterval
+)
+
 type relayOptions struct {
 	proxyListen   string
 	secureListen  string
@@ -678,24 +683,61 @@ func (s *relayServer) handleSocksConn(conn net.Conn) {
 }
 
 func (s *relayServer) collectStatus(r *http.Request) statusPayload {
-	agents := make([]statusAgent, 0)
+	agentsByID := make(map[string]statusAgent, len(s.agentDirectory))
+	for id, record := range s.agentDirectory {
+		agent := statusAgent{
+			ID:             id,
+			Identification: record.Identification,
+			Location:       record.Location,
+			Status:         "disconnected",
+		}
+		if len(record.ACLPatterns) > 0 {
+			agent.ACL = append(agent.ACL, record.ACLPatterns...)
+		}
+		if r != nil {
+			agent.AutoConfig = s.autoConfigURL(r, id)
+		}
+		agentsByID[id] = agent
+	}
+
 	s.agents.Range(func(_, value any) bool {
 		if session, ok := value.(*relayAgentSession); ok {
-			agent := session.snapshot()
-			if r != nil {
-				agent.AutoConfig = s.autoConfigURL(r, agent.ID)
+			snapshot := session.snapshot()
+			base, exists := agentsByID[snapshot.ID]
+			if exists && len(snapshot.ACL) == 0 {
+				snapshot.ACL = base.ACL
 			}
-			agents = append(agents, agent)
+			if snapshot.AutoConfig == "" && r != nil {
+				snapshot.AutoConfig = s.autoConfigURL(r, snapshot.ID)
+			}
+			agentsByID[snapshot.ID] = snapshot
 		}
 		return true
 	})
+
+	agents := make([]statusAgent, 0, len(agentsByID))
+	totalStreams := 0
+	connectedCount := 0
+	for id, agent := range agentsByID {
+		if agent.ID == "" {
+			agent.ID = id
+		}
+		if agent.AutoConfig == "" && r != nil {
+			agent.AutoConfig = s.autoConfigURL(r, agent.ID)
+		}
+		if agent.Status == "" {
+			agent.Status = "connected"
+		}
+		if agent.Status != "disconnected" {
+			connectedCount++
+			totalStreams += len(agent.Streams)
+		}
+		agents = append(agents, agent)
+	}
+
 	sort.Slice(agents, func(i, j int) bool {
 		return agents[i].ID < agents[j].ID
 	})
-	totalStreams := 0
-	for _, agent := range agents {
-		totalStreams += len(agent.Streams)
-	}
 
 	resources := resourceSnapshot{}
 	if s.resources != nil {
@@ -711,7 +753,7 @@ func (s *relayServer) collectStatus(r *http.Request) statusPayload {
 		ACMEHosts:   append([]string(nil), s.opts.acmeHosts...),
 		Agents:      agents,
 		Metrics: statusMetrics{
-			AgentsConnected: len(agents),
+			AgentsConnected: connectedCount,
 			ActiveStreams:   totalStreams,
 			BytesUp:         s.stats.bytesUp.Load(),
 			BytesDown:       s.stats.bytesDown.Load(),
@@ -831,14 +873,23 @@ type statusMetrics struct {
 }
 
 type statusAgent struct {
-	ID             string         `json:"id"`
-	Identification string         `json:"identification"`
-	Location       string         `json:"location"`
-	Remote         string         `json:"remote"`
-	ConnectedAt    time.Time      `json:"connectedAt"`
-	ACL            []string       `json:"acl"`
-	Streams        []statusStream `json:"streams"`
-	AutoConfig     string         `json:"autoConfig"`
+	ID                string         `json:"id"`
+	Identification    string         `json:"identification"`
+	Location          string         `json:"location"`
+	Status            string         `json:"status"`
+	Remote            string         `json:"remote,omitempty"`
+	ConnectedAt       time.Time      `json:"connectedAt,omitempty"`
+	LastHeartbeatAt   time.Time      `json:"lastHeartbeatAt,omitempty"`
+	LatencyMillis     float64        `json:"latencyMillis,omitempty"`
+	JitterMillis      float64        `json:"jitterMillis,omitempty"`
+	HeartbeatSeq      uint64         `json:"heartbeatSeq,omitempty"`
+	HeartbeatFailures int            `json:"heartbeatFailures,omitempty"`
+	ErrorCount        int64          `json:"errorCount,omitempty"`
+	LastError         string         `json:"lastError,omitempty"`
+	LastErrorAt       time.Time      `json:"lastErrorAt,omitempty"`
+	ACL               []string       `json:"acl,omitempty"`
+	Streams           []statusStream `json:"streams"`
+	AutoConfig        string         `json:"autoConfig,omitempty"`
 }
 
 type statusStream struct {
@@ -880,6 +931,32 @@ func portFromAddr(addr string) string {
 		return ""
 	}
 	return port
+}
+
+func millisToDuration(ms float64) time.Duration {
+	if ms <= 0 {
+		return 0
+	}
+	return time.Duration(ms * float64(time.Millisecond))
+}
+
+func durationToMillis(d time.Duration) float64 {
+	if d <= 0 {
+		return 0
+	}
+	return float64(d) / float64(time.Millisecond)
+}
+
+func safeLatencyFromSent(sentAt int64, now time.Time) time.Duration {
+	if sentAt == 0 {
+		return 0
+	}
+	sent := time.Unix(0, sentAt)
+	latency := now.Sub(sent)
+	if latency < 0 {
+		return 0
+	}
+	return latency
 }
 
 func generatePAC(agentID, token, socksHost, socksPort, proxyHost, proxyPort string) string {
@@ -1002,6 +1079,20 @@ type relayAgentSession struct {
 	shutdown chan struct{}
 	closed   bool
 	closeMu  sync.Mutex
+
+	heartbeatMu          sync.Mutex
+	lastHeartbeat        time.Time
+	latency              time.Duration
+	jitter               time.Duration
+	heartbeatSeq         uint64
+	heartbeatFailures    int
+	lastHeartbeatError   string
+	lastHeartbeatErrorAt time.Time
+
+	errorMu     sync.Mutex
+	errorCount  int64
+	lastError   string
+	lastErrorAt time.Time
 }
 
 var errSessionClosed = errors.New("agent session closed")
@@ -1141,6 +1232,8 @@ func (s *relayAgentSession) readLoop() {
 				s.handleClose(f)
 			case protocol.FrameTypeError:
 				s.handleError(f)
+			case protocol.FrameTypeHeartbeat:
+				s.handleHeartbeat(f)
 			default:
 				s.server.logger.Warn("unknown frame type", "agent", s.id, "type", f.Type)
 			}
@@ -1206,9 +1299,46 @@ func (s *relayAgentSession) handleError(f protocol.Frame) {
 	stream := s.lookupStream(f.StreamID)
 	if stream == nil {
 		s.server.logger.Warn("error frame for unknown stream", "agent", s.id, "stream", f.StreamID, "error", f.Error)
+		if f.Error != "" {
+			s.recordAgentError(f.Error)
+		}
 		return
 	}
+	if f.Error != "" {
+		s.recordAgentError(f.Error)
+	}
 	stream.closeFromAgent(errors.New(f.Error))
+}
+
+func (s *relayAgentSession) handleHeartbeat(f protocol.Frame) {
+	payload := f.Heartbeat
+	if payload == nil {
+		s.server.logger.Warn("heartbeat frame missing payload", "agent", s.id)
+		return
+	}
+
+	now := time.Now()
+	switch payload.Mode {
+	case protocol.HeartbeatModePing, "":
+		s.updateHeartbeatFromAgent(payload, now)
+		reply := &protocol.Frame{
+			Type: protocol.FrameTypeHeartbeat,
+			Heartbeat: &protocol.HeartbeatPayload{
+				Sequence: payload.Sequence,
+				SentAt:   payload.SentAt,
+				AckAt:    now.UnixNano(),
+				Mode:     protocol.HeartbeatModePong,
+			},
+		}
+		if err := s.send(reply); err != nil {
+			s.server.logger.Debug("heartbeat pong failed", "agent", s.id, "error", err)
+			s.markHeartbeatFailure()
+		}
+	case protocol.HeartbeatModePong:
+		s.updateHeartbeatAck(payload, now)
+	default:
+		s.server.logger.Warn("heartbeat frame with unknown mode", "agent", s.id, "mode", payload.Mode)
+	}
 }
 
 func (s *relayAgentSession) lookupStream(id string) *relayStream {
@@ -1306,14 +1436,128 @@ func (s *relayAgentSession) close() {
 	}
 }
 
+func (s *relayAgentSession) updateHeartbeatFromAgent(payload *protocol.HeartbeatPayload, now time.Time) {
+	s.heartbeatMu.Lock()
+	s.lastHeartbeat = now
+	s.heartbeatSeq = payload.Sequence
+	if payload.Stats != nil {
+		if payload.Stats.RTTMillis > 0 {
+			s.latency = millisToDuration(payload.Stats.RTTMillis)
+		} else if payload.SentAt != 0 {
+			s.latency = safeLatencyFromSent(payload.SentAt, now)
+		}
+		if payload.Stats.JitterMillis > 0 {
+			s.jitter = millisToDuration(payload.Stats.JitterMillis)
+		}
+		if payload.Stats.ConsecutiveFailures > 0 {
+			s.heartbeatFailures = payload.Stats.ConsecutiveFailures
+		} else {
+			s.heartbeatFailures = 0
+		}
+		if payload.Stats.LastError != "" {
+			s.lastHeartbeatError = payload.Stats.LastError
+			if payload.Stats.LastErrorAt != 0 {
+				s.lastHeartbeatErrorAt = time.Unix(0, payload.Stats.LastErrorAt)
+			} else {
+				s.lastHeartbeatErrorAt = now
+			}
+		}
+	} else {
+		if payload.SentAt != 0 {
+			s.latency = safeLatencyFromSent(payload.SentAt, now)
+		}
+		s.heartbeatFailures = 0
+	}
+	s.heartbeatMu.Unlock()
+}
+
+func (s *relayAgentSession) updateHeartbeatAck(payload *protocol.HeartbeatPayload, now time.Time) {
+	if payload == nil {
+		return
+	}
+	s.heartbeatMu.Lock()
+	s.lastHeartbeat = now
+	s.heartbeatSeq = payload.Sequence
+	if payload.AckAt != 0 && payload.SentAt != 0 {
+		s.latency = safeLatencyFromSent(payload.SentAt, time.Unix(0, payload.AckAt))
+	}
+	s.heartbeatMu.Unlock()
+}
+
+func (s *relayAgentSession) markHeartbeatFailure() {
+	s.heartbeatMu.Lock()
+	s.heartbeatFailures++
+	s.heartbeatMu.Unlock()
+}
+
+func (s *relayAgentSession) recordAgentError(message string) {
+	if message == "" {
+		return
+	}
+	now := time.Now()
+	s.errorMu.Lock()
+	s.errorCount++
+	s.lastError = message
+	s.lastErrorAt = now
+	s.errorMu.Unlock()
+
+	s.heartbeatMu.Lock()
+	s.lastHeartbeatError = message
+	s.lastHeartbeatErrorAt = now
+	s.heartbeatMu.Unlock()
+}
+
 func (s *relayAgentSession) snapshot() statusAgent {
+	now := time.Now()
 	agent := statusAgent{
 		ID:             s.id,
 		Identification: s.identification,
 		Location:       s.location,
 		Remote:         s.remote,
 		ConnectedAt:    s.connectedAt,
+		Status:         "connected",
 	}
+	s.heartbeatMu.Lock()
+	lastHeartbeat := s.lastHeartbeat
+	latency := s.latency
+	jitter := s.jitter
+	seq := s.heartbeatSeq
+	failures := s.heartbeatFailures
+	hbLastError := s.lastHeartbeatError
+	hbLastErrorAt := s.lastHeartbeatErrorAt
+	s.heartbeatMu.Unlock()
+
+	if lastHeartbeat.IsZero() {
+		lastHeartbeat = s.connectedAt
+	}
+	if !lastHeartbeat.IsZero() && now.Sub(lastHeartbeat) > heartbeatDegradedAfter {
+		agent.Status = "degraded"
+	}
+	if failures > 0 {
+		agent.Status = "degraded"
+	}
+
+	agent.LastHeartbeatAt = lastHeartbeat
+	agent.LatencyMillis = durationToMillis(latency)
+	agent.JitterMillis = durationToMillis(jitter)
+	agent.HeartbeatSeq = seq
+	agent.HeartbeatFailures = failures
+
+	s.errorMu.Lock()
+	agent.ErrorCount = s.errorCount
+	lastError := s.lastError
+	lastErrorAt := s.lastErrorAt
+	s.errorMu.Unlock()
+
+	if hbLastErrorAt.After(lastErrorAt) {
+		lastErrorAt = hbLastErrorAt
+		lastError = hbLastError
+	}
+	if lastError != "" {
+		agent.LastError = lastError
+		agent.LastErrorAt = lastErrorAt
+	}
+
 	if len(s.aclPatterns) > 0 {
 		agent.ACL = append(agent.ACL, s.aclPatterns...)
 	}
