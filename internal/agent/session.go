@@ -373,9 +373,6 @@ func (s *session) handleHeartbeat(f protocol.Frame) {
 	switch payload.Mode {
 	case protocol.HeartbeatModePong:
 		ackTime := time.Now()
-		if payload.AckAt != 0 {
-			ackTime = time.Unix(0, payload.AckAt)
-		}
 		s.heartbeat.handleAck(payload.Sequence, ackTime)
 		_ = s.conn.SetReadDeadline(time.Now().Add(heartbeatTimeout))
 	case protocol.HeartbeatModePing:
@@ -384,7 +381,6 @@ func (s *session) handleHeartbeat(f protocol.Frame) {
 			Heartbeat: &protocol.HeartbeatPayload{
 				Sequence: payload.Sequence,
 				SentAt:   payload.SentAt,
-				AckAt:    time.Now().UnixNano(),
 				Mode:     protocol.HeartbeatModePong,
 			},
 		}

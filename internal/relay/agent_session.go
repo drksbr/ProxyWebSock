@@ -287,7 +287,6 @@ func (s *relayAgentSession) handleHeartbeat(f protocol.Frame) {
 			Heartbeat: &protocol.HeartbeatPayload{
 				Sequence: payload.Sequence,
 				SentAt:   payload.SentAt,
-				AckAt:    now.UnixNano(),
 				Mode:     protocol.HeartbeatModePong,
 			},
 		}
@@ -439,8 +438,8 @@ func (s *relayAgentSession) updateHeartbeatAck(payload *protocol.HeartbeatPayloa
 	s.heartbeatMu.Lock()
 	s.lastHeartbeat = now
 	s.heartbeatSeq = payload.Sequence
-	if payload.AckAt != 0 && payload.SentAt != 0 {
-		s.latency = safeLatencyFromSent(payload.SentAt, time.Unix(0, payload.AckAt))
+	if payload.SentAt != 0 {
+		s.latency = safeLatencyFromSent(payload.SentAt, now)
 	}
 	s.heartbeatMu.Unlock()
 }

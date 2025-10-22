@@ -8,23 +8,23 @@ import (
 type FrameType string
 
 const (
-	FrameTypeRegister FrameType = "register"
-	FrameTypeDial     FrameType = "dial"
-	FrameTypeWrite    FrameType = "write"
-	FrameTypeClose    FrameType = "close"
-	FrameTypeError    FrameType = "err"
+	FrameTypeRegister  FrameType = "register"
+	FrameTypeDial      FrameType = "dial"
+	FrameTypeWrite     FrameType = "write"
+	FrameTypeClose     FrameType = "close"
+	FrameTypeError     FrameType = "err"
 	FrameTypeHeartbeat FrameType = "heartbeat"
 )
 
 type Frame struct {
-	Type     FrameType `json:"type"`
-	AgentID  string    `json:"agentId,omitempty"`
-	Token    string    `json:"token,omitempty"`
-	StreamID string    `json:"streamId,omitempty"`
-	Host     string    `json:"host,omitempty"`
-	Port     int       `json:"port,omitempty"`
-	Payload  string    `json:"payload,omitempty"`
-	Error    string    `json:"error,omitempty"`
+	Type      FrameType         `json:"type"`
+	AgentID   string            `json:"agentId,omitempty"`
+	Token     string            `json:"token,omitempty"`
+	StreamID  string            `json:"streamId,omitempty"`
+	Host      string            `json:"host,omitempty"`
+	Port      int               `json:"port,omitempty"`
+	Payload   string            `json:"payload,omitempty"`
+	Error     string            `json:"error,omitempty"`
 	Heartbeat *HeartbeatPayload `json:"heartbeat,omitempty"`
 }
 
@@ -89,9 +89,8 @@ type HeartbeatStats struct {
 }
 
 type HeartbeatPayload struct {
-	Sequence  uint64        `json:"seq"`
-	SentAt    int64         `json:"sentAt"`
-	AckAt     int64         `json:"ackAt,omitempty"`
-	Mode      HeartbeatMode `json:"mode,omitempty"`
-	Stats     *HeartbeatStats `json:"stats,omitempty"`
+	Sequence uint64          `json:"seq"`
+	SentAt   int64           `json:"sentAt"`
+	Mode     HeartbeatMode   `json:"mode,omitempty"`
+	Stats    *HeartbeatStats `json:"stats,omitempty"`
 }
