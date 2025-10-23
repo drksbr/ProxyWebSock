@@ -8,7 +8,7 @@ services:
     container_name: intratun-relay
     command:
       - relay
-      - --agent-config ./config/agents.example.yaml
+      - --agent-config=/config/agents.yaml
       - --stream-id-mode=cuid
       - --proxy-listen=:8080
       - --secure-listen=:443

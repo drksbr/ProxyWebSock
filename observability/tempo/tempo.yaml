@@ -20,7 +20,7 @@ ingester:
 compactor:
   compaction:
     block_retention: 24h
-    compacted_block_retention: 7d
+    compacted_block_retention: 168h
 storage:
   trace:
     backend: local
