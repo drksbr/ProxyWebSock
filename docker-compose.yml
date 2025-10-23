@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   relay:
     build:
@@ -71,7 +69,7 @@ services:
     extra_hosts:
       - "relay.local:host-gateway"
     depends_on:
-      - intratun-relay
+      - relay
     networks:
       - intratun
       - observability
