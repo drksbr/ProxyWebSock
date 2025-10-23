@@ -4,6 +4,8 @@ server:
   http_listen_port: 3100
   grpc_listen_port: 9096
   log_level: warn
+  http_listen_address: 0.0.0.0
+  grpc_listen_address: 0.0.0.0
 
 common:
   path_prefix: /loki
@@ -27,6 +29,7 @@ storage_config:
   boltdb_shipper:
     active_index_directory: /loki/index
     cache_location: /loki/boltdb-cache
+    shared_store: filesystem
   filesystem:
     directory: /loki/chunks
 
