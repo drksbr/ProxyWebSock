@@ -16,6 +16,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/shirou/gopsutil/v4/process"
 
+	"github.com/drksbr/ProxyWebSock/internal/logger"
 	"github.com/drksbr/ProxyWebSock/internal/protocol"
 )
 
@@ -36,6 +37,7 @@ type session struct {
 	streams   map[string]*agentStream
 	streamsMu sync.RWMutex
 	logger    *slog.Logger
+	traceID   string
 
 	heartbeat     *heartbeatState
 	controlQueue  chan outboundMessage
@@ -48,11 +50,13 @@ type session struct {
 
 func newSession(agent *agent, conn *websocket.Conn) *session {
 	proc, _ := process.NewProcess(int32(os.Getpid()))
+	traceID := logger.NewTraceID()
 	return &session{
 		agent:        agent,
 		conn:         conn,
 		streams:      make(map[string]*agentStream),
-		logger:       agent.logger.With("session", time.Now().UnixNano()),
+		logger:       agent.logger.With("session", time.Now().UnixNano(), "trace_id", traceID),
+		traceID:      traceID,
 		heartbeat:    newHeartbeatState(),
 		controlQueue: make(chan outboundMessage, 128),
 		dataQueue:    make(chan outboundMessage, 256),
@@ -223,6 +227,7 @@ func (s *session) enqueueMessage(ch chan outboundMessage, msg outboundMessage) (
 }
 
 func (s *session) run(ctx context.Context) error {
+	ctx = logger.ContextWithTrace(ctx, s.traceID)
 	defer s.conn.Close()
 
 	s.conn.SetReadLimit(1 << 20)
@@ -561,11 +566,26 @@ func (s *session) sendFrame(f *protocol.Frame) error {
 }
 
 func (s *session) sendBinary(streamID string, payload []byte, onWrite func(success bool)) error {
-	data, err := protocol.EncodeBinaryFrame(streamID, payload)
+	data, release, err := protocol.EncodeBinaryFramePooled(streamID, payload)
 	if err != nil {
 		return err
 	}
-	return s.enqueueData(outboundMessage{binary: data, onWrite: onWrite})
+	msg := outboundMessage{binary: data}
+	if onWrite != nil {
+		msg.onWrite = func(success bool) {
+			release()
+			onWrite(success)
+		}
+	} else {
+		msg.onWrite = func(bool) {
+			release()
+		}
+	}
+	if err := s.enqueueData(msg); err != nil {
+		release()
+		return err
+	}
+	return nil
 }
 
 func (s *session) storeStream(stream *agentStream) error {

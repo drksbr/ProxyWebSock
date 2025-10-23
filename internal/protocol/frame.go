@@ -3,6 +3,7 @@ package protocol
 import (
 	"encoding/base64"
 	"fmt"
+	"sync"
 )
 
 type FrameType string
@@ -47,15 +48,59 @@ func DecodePayload(encoded string) ([]byte, error) {
 }
 
 func EncodeBinaryFrame(streamID string, payload []byte) ([]byte, error) {
+	buf, release, err := EncodeBinaryFramePooled(streamID, payload)
+	if err != nil {
+		return nil, err
+	}
+	copyBuf := make([]byte, len(buf))
+	copy(copyBuf, buf)
+	release()
+	return copyBuf, nil
+}
+
+const maxPooledFrameSize = 1024 * 1024
+
+var binaryFramePool = sync.Pool{
+	New: func() any {
+		return make([]byte, 0, 64*1024)
+	},
+}
+
+// EncodeBinaryFramePooled encodes the stream identifier and payload using a pooled backing buffer.
+// The caller MUST invoke the returned release function exactly once after the slice is no longer needed.
+func EncodeBinaryFramePooled(streamID string, payload []byte) ([]byte, func(), error) {
 	idLen := len(streamID)
 	if idLen == 0 || idLen > 255 {
-		return nil, fmt.Errorf("invalid stream id length %d", idLen)
+		return nil, nil, fmt.Errorf("invalid stream id length %d", idLen)
 	}
-	buf := make([]byte, 1+idLen+len(payload))
-	buf[0] = byte(idLen)
-	copy(buf[1:1+idLen], streamID)
-	copy(buf[1+idLen:], payload)
-	return buf, nil
+	total := 1 + idLen + len(payload)
+	buf := borrowFrameBuffer(total)
+	frame := buf[:total]
+	frame[0] = byte(idLen)
+	copy(frame[1:1+idLen], streamID)
+	copy(frame[1+idLen:], payload)
+	release := func() {
+		releaseFrameBuffer(buf)
+	}
+	return frame, release, nil
+}
+
+func borrowFrameBuffer(size int) []byte {
+	buf := binaryFramePool.Get().([]byte)
+	if cap(buf) < size {
+		return make([]byte, size)
+	}
+	return buf[:size]
+}
+
+func releaseFrameBuffer(buf []byte) {
+	if buf == nil {
+		return
+	}
+	if cap(buf) > maxPooledFrameSize {
+		return
+	}
+	binaryFramePool.Put(buf[:0])
 }
 
 func DecodeBinaryFrame(data []byte) (string, []byte, error) {

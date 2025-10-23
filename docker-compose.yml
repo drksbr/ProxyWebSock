@@ -5,43 +5,161 @@ services:
     build:
       context: .
     image: intratun:latest
+    container_name: intratun-relay
     command:
       - relay
       - --proxy-listen=:8080
       - --secure-listen=:8443
       - --socks-listen=:1080
-      - --agents=intra:changeme
+      - --agent-config=/config/agents.yaml
       - --acl-allow=^.*:443$
-      - --acme-host=relay.example.com
-      - --acme-email=ops@example.com
-      - --acme-cache=/var/lib/intratun/acme
+      - --max-frame=32768
+      - --stream-queue-depth=2048
+      - --log-level=debug
     environment:
       - TZ=UTC
+      - INTRATUN_JSON_LOGS=true
+      - INTRATUN_TRACE_ENABLED=true
+      - INTRATUN_TRACE_EXPORTER=otlp-grpc
+      - INTRATUN_TRACE_ENDPOINT=otel-collector:4317
+      - INTRATUN_TRACE_INSECURE=true
+      - INTRATUN_RELAY_ACME_HOST=relay.local
+      - INTRATUN_RELAY_ACME_EMAIL=ops@example.com
     volumes:
-      - ./acme-cache:/var/lib/intratun/acme
+      - ./config/agents.example.yaml:/config/agents.yaml:ro
     ports:
       - "8080:8080"   # HTTP CONNECT
-      - "8443:8443"   # WSS, dashboard, metrics
-      - "1080:1080"   # Optional SOCKS5
+      - "8443:8443"   # Web dashboard, metrics, /tunnel
+      - "1080:1080"   # SOCKS5
+    depends_on:
+      - otel-collector
     networks:
       - intratun
+      - observability
 
   agent:
     image: intratun:latest
+    container_name: intratun-agent
     profiles:
       - agent
     command:
       - agent
-      - --relay=wss://relay.example.com:8443/tunnel
+      - --relay=wss://relay.local:8443/tunnel
       - --id=intra
       - --token=changeme
       - --dial-timeout-ms=5000
+      - --log-level=debug
     environment:
       - TZ=UTC
+      - INTRATUN_JSON_LOGS=true
+      - INTRATUN_TRACE_ENABLED=true
+      - INTRATUN_TRACE_EXPORTER=otlp-grpc
+      - INTRATUN_TRACE_ENDPOINT=otel-collector:4317
+      - INTRATUN_TRACE_INSECURE=true
     extra_hosts:
-      - "relay.example.com:host-gateway" # adjust or remove depending on DNS setup
+      - "relay.local:host-gateway"
+    depends_on:
+      - relay
     networks:
       - intratun
+      - observability
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.100.0
+    container_name: otel-collector
+    command: ["--config=/etc/otel-collector/config.yaml"]
+    volumes:
+      - ./observability/otel-collector/config.yaml:/etc/otel-collector/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8889:8889"   # Prometheus exporter
+    depends_on:
+      - tempo
+    networks:
+      - observability
+
+  prometheus:
+    image: prom/prometheus:v2.53.2
+    container_name: prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - otel-collector
+    networks:
+      - observability
+
+  tempo:
+    image: grafana/tempo:2.4.1
+    container_name: tempo
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./observability/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200"
+    networks:
+      - observability
+
+  loki:
+    image: grafana/loki:3.1.0
+    container_name: loki
+    command: ["-config.file=/etc/loki/config.yaml"]
+    volumes:
+      - ./observability/loki/config.yaml:/etc/loki/config.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+    networks:
+      - observability
+
+  promtail:
+    image: grafana/promtail:3.1.0
+    container_name: promtail
+    command: ["-config.file=/etc/promtail/config.yml"]
+    volumes:
+      - ./observability/promtail/config.yml:/etc/promtail/config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+    networks:
+      - observability
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_PATHS_PROVISIONING=/etc/grafana/provisioning
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./observability/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./observability/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./observability/grafana/dashboards-json:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
+    networks:
+      - observability
+
+volumes:
+  prometheus-data:
+  grafana-data:
+  tempo-data:
+  loki-data:
 
 networks:
   intratun: {}
+  observability: {}

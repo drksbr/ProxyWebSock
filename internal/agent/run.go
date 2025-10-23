@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -17,6 +19,8 @@ import (
 type agent struct {
 	opts   *options
 	logger *slog.Logger
+	rngMu  sync.Mutex
+	rng    *rand.Rand
 }
 
 func (o *options) run(ctx context.Context) error {
@@ -39,7 +43,8 @@ func (a *agent) run(ctx context.Context) error {
 			return err
 		}
 		if err != nil {
-			a.logger.Warn("connection failed", "error", err)
+			delay := a.jitter(backoff)
+			a.logger.Warn("connection failed", "error", err, "retry_in", delay.String())
 		} else {
 			a.logger.Info("connection terminated, reconnecting")
 		}
@@ -49,8 +54,9 @@ func (a *agent) run(ctx context.Context) error {
 		if time.Since(start) > time.Minute {
 			backoff = a.opts.reconnectMin
 		}
+		sleep := a.jitter(backoff)
 		select {
-		case <-time.After(backoff):
+		case <-time.After(sleep):
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -61,6 +67,22 @@ func (a *agent) run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+func (a *agent) jitter(base time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	a.rngMu.Lock()
+	if a.rng == nil {
+		a.rng = rand.New(rand.NewSource(time.Now().UnixNano()))
+	}
+	f := 0.4
+	min := 1 - f/2
+	max := 1 + f/2
+	scale := min + a.rng.Float64()*(max-min)
+	a.rngMu.Unlock()
+	return time.Duration(float64(base) * scale)
 }
 
 func (a *agent) connectOnce(ctx context.Context) error {

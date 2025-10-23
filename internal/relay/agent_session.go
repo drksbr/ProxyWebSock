@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"regexp"
 	"sort"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	logctx "github.com/drksbr/ProxyWebSock/internal/logger"
 	"github.com/drksbr/ProxyWebSock/internal/protocol"
 )
 
@@ -37,6 +39,7 @@ type controlMessage struct {
 type relayAgentSession struct {
 	server *relayServer
 	conn   *websocket.Conn
+	logger *slog.Logger
 
 	id             string
 	identification string
@@ -52,6 +55,7 @@ type relayAgentSession struct {
 	shutdown chan struct{}
 	closed   bool
 	closeMu  sync.Mutex
+	traceID  string
 
 	controlQueue  chan outboundMessage
 	dataQueue     chan outboundMessage
@@ -88,15 +92,19 @@ var (
 )
 
 func newRelayAgentSession(server *relayServer, conn *websocket.Conn, remote string) *relayAgentSession {
+	traceID := logctx.NewTraceID()
+	sessionLogger := server.logger.With("trace_id", traceID, "remote", remote)
 	return &relayAgentSession{
 		server:       server,
 		conn:         conn,
+		logger:       sessionLogger,
 		remote:       remote,
 		streams:      make(map[string]*relayStream),
 		shutdown:     make(chan struct{}),
 		controlQueue: make(chan outboundMessage, 128),
 		dataQueue:    make(chan outboundMessage, 256),
 		writerDone:   make(chan struct{}),
+		traceID:      traceID,
 	}
 }
 
@@ -143,7 +151,7 @@ func (s *relayAgentSession) writerLoop() {
 					if msg.onWrite != nil {
 						msg.onWrite(false)
 					}
-					s.server.logger.Warn("writer failed", "agent", s.id, "error", err)
+					s.logger.Warn("writer failed", "error", err)
 					return
 				}
 				if msg.onWrite != nil {
@@ -183,7 +191,7 @@ func (s *relayAgentSession) writerLoop() {
 			if msg.onWrite != nil {
 				msg.onWrite(false)
 			}
-			s.server.logger.Warn("writer failed", "agent", s.id, "error", err)
+			s.logger.Warn("writer failed", "error", err)
 			return
 		}
 		if msg.onWrite != nil {
@@ -213,7 +221,7 @@ func (s *relayAgentSession) writeMessage(msg *outboundMessage) error {
 			return writeErr
 		}
 		if err := s.conn.SetWriteDeadline(time.Time{}); err != nil {
-			s.server.logger.Debug("reset write deadline failed", "agent", s.id, "error", err)
+			s.logger.Debug("reset write deadline failed", "error", err)
 		}
 		return nil
 	}
@@ -226,7 +234,7 @@ func (s *relayAgentSession) writeMessage(msg *outboundMessage) error {
 			return writeErr
 		}
 		if err := s.conn.SetWriteDeadline(time.Time{}); err != nil {
-			s.server.logger.Debug("reset write deadline failed", "agent", s.id, "error", err)
+			s.logger.Debug("reset write deadline failed", "error", err)
 		}
 		return nil
 	}
@@ -259,14 +267,14 @@ func (s *relayAgentSession) run() {
 	defer s.stopWriter()
 
 	if err := s.performRegister(); err != nil {
-		s.server.logger.Warn("register failed", "error", err, "remote", s.remote)
+		s.logger.Warn("register failed", "error", err)
 		return
 	}
 
 	s.connectedAt = time.Now()
 	s.server.registerAgent(s)
 	s.startWriter()
-	s.server.logger.Info("agent connected", "agent", s.id, "remote", s.remote)
+	s.logger.Info("agent connected")
 
 	readDone := make(chan struct{})
 	go func() {
@@ -289,7 +297,7 @@ func (s *relayAgentSession) run() {
 			return
 		case <-pingTicker.C:
 			if err := s.sendControl(websocket.PingMessage); err != nil {
-				s.server.logger.Debug("ping failed", "agent", s.id, "error", err)
+				s.logger.Debug("ping failed", "error", err)
 				return
 			}
 		}
@@ -322,6 +330,14 @@ func (s *relayAgentSession) performRegister() error {
 	if len(record.ACLPatterns) > 0 {
 		s.aclPatterns = append([]string(nil), record.ACLPatterns...)
 	}
+	attrs := []any{slog.String("agent", s.id)}
+	if s.identification != "" {
+		attrs = append(attrs, slog.String("agent_identification", s.identification))
+	}
+	if s.location != "" {
+		attrs = append(attrs, slog.String("agent_location", s.location))
+	}
+	s.logger = s.logger.With(attrs...)
 	if s.server.opts.wsIdle > 0 {
 		if err := s.conn.SetReadDeadline(time.Now().Add(s.server.opts.wsIdle)); err != nil {
 			return err
@@ -346,9 +362,9 @@ func (s *relayAgentSession) readLoop() {
 		messageType, r, err := s.conn.NextReader()
 		if err != nil {
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) || errors.Is(err, net.ErrClosed) {
-				s.server.logger.Info("agent disconnected", "agent", s.id)
+				s.logger.Info("agent disconnected")
 			} else {
-				s.server.logger.Warn("agent read failed", "agent", s.id, "error", err)
+				s.logger.Warn("agent read failed", "error", err)
 			}
 			return
 		}
@@ -357,19 +373,19 @@ func (s *relayAgentSession) readLoop() {
 		case websocket.BinaryMessage:
 			data, err := io.ReadAll(r)
 			if err != nil {
-				s.server.logger.Warn("binary read failed", "agent", s.id, "error", err)
+				s.logger.Warn("binary read failed", "error", err)
 				return
 			}
 			streamID, payload, err := protocol.DecodeBinaryFrame(data)
 			if err != nil {
-				s.server.logger.Warn("binary decode failed", "agent", s.id, "error", err)
+				s.logger.Warn("binary decode failed", "error", err)
 				continue
 			}
 			s.handleBinaryWrite(streamID, payload)
 		case websocket.TextMessage:
 			var f protocol.Frame
 			if err := json.NewDecoder(r).Decode(&f); err != nil {
-				s.server.logger.Warn("frame decode failed", "agent", s.id, "error", err)
+				s.logger.Warn("frame decode failed", "error", err)
 				return
 			}
 			switch f.Type {
@@ -384,7 +400,7 @@ func (s *relayAgentSession) readLoop() {
 			case protocol.FrameTypeHeartbeat:
 				s.handleHeartbeat(f)
 			default:
-				s.server.logger.Warn("unknown frame type", "agent", s.id, "type", f.Type)
+				s.logger.Warn("unknown frame type", "type", f.Type)
 			}
 		default:
 			// ignore other message types
@@ -395,7 +411,7 @@ func (s *relayAgentSession) readLoop() {
 func (s *relayAgentSession) handleDialAck(f protocol.Frame) {
 	stream := s.lookupStream(f.StreamID)
 	if stream == nil {
-		s.server.logger.Warn("dial ack for unknown stream", "agent", s.id, "stream", f.StreamID)
+		s.logger.Warn("dial ack for unknown stream", "stream", f.StreamID)
 		return
 	}
 	if f.Error != "" {
@@ -408,12 +424,12 @@ func (s *relayAgentSession) handleDialAck(f protocol.Frame) {
 func (s *relayAgentSession) handleWrite(f protocol.Frame) {
 	stream := s.lookupStream(f.StreamID)
 	if stream == nil {
-		s.server.logger.Debug("write for unknown stream", "agent", s.id, "stream", f.StreamID)
+		s.logger.Debug("write for unknown stream", "stream", f.StreamID)
 		return
 	}
 	payload, err := protocol.DecodePayload(f.Payload)
 	if err != nil {
-		s.server.logger.Warn("payload decode failed", "agent", s.id, "stream", f.StreamID, "error", err)
+		s.logger.Warn("payload decode failed", "stream", f.StreamID, "error", err)
 		return
 	}
 	s.handleBinaryWrite(f.StreamID, payload)
@@ -422,7 +438,7 @@ func (s *relayAgentSession) handleWrite(f protocol.Frame) {
 func (s *relayAgentSession) handleBinaryWrite(streamID string, payload []byte) {
 	stream := s.lookupStream(streamID)
 	if stream == nil {
-		s.server.logger.Debug("write for unknown stream", "agent", s.id, "stream", streamID)
+		s.logger.Debug("write for unknown stream", "stream", streamID)
 		return
 	}
 	stream.markReady(nil)
@@ -434,9 +450,9 @@ func (s *relayAgentSession) handleBinaryWrite(streamID string, payload []byte) {
 			return
 		}
 		if errors.Is(err, errClientBacklog) {
-			s.server.logger.Debug("client backlog exceeded", "agent", s.id, "stream", streamID)
+			s.logger.Debug("client backlog exceeded", "stream", streamID)
 		} else {
-			s.server.logger.Debug("enqueue to client failed", "agent", s.id, "stream", streamID, "error", err)
+			s.logger.Debug("enqueue to client failed", "stream", streamID, "error", err)
 		}
 		stream.closeFromRelay(err)
 		return
@@ -454,7 +470,7 @@ func (s *relayAgentSession) handleClose(f protocol.Frame) {
 func (s *relayAgentSession) handleError(f protocol.Frame) {
 	stream := s.lookupStream(f.StreamID)
 	if stream == nil {
-		s.server.logger.Warn("error frame for unknown stream", "agent", s.id, "stream", f.StreamID, "error", f.Error)
+		s.logger.Warn("error frame for unknown stream", "stream", f.StreamID, "error", f.Error)
 		if f.Error != "" {
 			s.recordAgentError(f.Error)
 		}
@@ -469,7 +485,7 @@ func (s *relayAgentSession) handleError(f protocol.Frame) {
 func (s *relayAgentSession) handleHeartbeat(f protocol.Frame) {
 	payload := f.Heartbeat
 	if payload == nil {
-		s.server.logger.Warn("heartbeat frame missing payload", "agent", s.id)
+		s.logger.Warn("heartbeat frame missing payload")
 		return
 	}
 
@@ -486,13 +502,13 @@ func (s *relayAgentSession) handleHeartbeat(f protocol.Frame) {
 			},
 		}
 		if err := s.send(reply); err != nil {
-			s.server.logger.Debug("heartbeat pong failed", "agent", s.id, "error", err)
+			s.logger.Debug("heartbeat pong failed", "error", err)
 			s.markHeartbeatFailure()
 		}
 	case protocol.HeartbeatModePong:
 		s.updateHeartbeatAck(payload, now)
 	default:
-		s.server.logger.Warn("heartbeat frame with unknown mode", "agent", s.id, "mode", payload.Mode)
+		s.logger.Warn("heartbeat frame with unknown mode", "mode", payload.Mode)
 	}
 }
 
@@ -533,11 +549,16 @@ func (s *relayAgentSession) send(f *protocol.Frame) error {
 }
 
 func (s *relayAgentSession) sendBinary(streamID string, payload []byte) error {
-	data, err := protocol.EncodeBinaryFrame(streamID, payload)
+	data, release, err := protocol.EncodeBinaryFramePooled(streamID, payload)
 	if err != nil {
 		return err
 	}
-	return s.enqueueData(outboundMessage{binary: data})
+	msg := outboundMessage{binary: data, onWrite: func(bool) { release() }}
+	if err := s.enqueueData(msg); err != nil {
+		release()
+		return err
+	}
+	return nil
 }
 
 func (s *relayAgentSession) sendControl(messageType int) error {

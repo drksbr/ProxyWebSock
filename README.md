@@ -80,7 +80,18 @@ _The agent maintains a persistent WSS tunnel, multiplexing traffic via JSON fram
 ### Build
 
 ```bash
-go build -o intratun ./cmd/intratun
+make build        # builds web assets and the Go binary
+```
+
+Other useful targets:
+
+```bash
+make lint         # golangci-lint with revive/staticcheck/gocritic
+make test         # go test ./...
+make race         # go test -race ./...
+make bench        # go test -bench=.
+make fuzz         # go test ./internal/protocol -fuzz=FuzzDecodeBinaryFrame
+make cover        # coverage report (build/coverage.out)
 ```
 
 ### Run the Relay
@@ -121,6 +132,62 @@ The agent reconnects automatically with exponential backoff and resolves DNS ins
 
 ---
 
+## Configuration Reference
+
+Configuration obeys **env > file > flags**. Both commands accept `--config` (YAML). Environment variables override file entries and finally CLI flags provide defaults.
+
+### Global
+
+| Variable                    | Purpose                                | Default    |
+| --------------------------- | -------------------------------------- | ---------- |
+| `INTRATUN_ENV`              | Environment name (log field)           | empty      |
+| `INTRATUN_SERVICE_NAME`     | Service name for logs/tracing          | `intratun` |
+| `INTRATUN_LOG_LEVEL`        | `debug`, `info`, `warn`, `error`       | `info`     |
+| `INTRATUN_JSON_LOGS`        | `true` for JSON logs                   | `false`    |
+| `INTRATUN_PID_FILE`         | Path for PID file                      | empty      |
+| `INTRATUN_TRACE_ENABLED`    | Enable OpenTelemetry tracing           | `false`    |
+| `INTRATUN_TRACE_EXPORTER`   | `stdout`, `otlp-grpc`, `otlp-http`     | `stdout`   |
+| `INTRATUN_TRACE_ENDPOINT`   | Exporter endpoint (`host:port` or URL) | empty      |
+| `INTRATUN_TRACE_INSECURE`   | Disable TLS for OTLP exporters         | `false`    |
+
+### Agent
+
+| Variable                              | Notes                                  |
+| ------------------------------------- | -------------------------------------- |
+| `INTRATUN_AGENT_CONFIG`               | YAML config path                       |
+| `INTRATUN_AGENT_RELAY`                | Relay WSS endpoint                     |
+| `INTRATUN_AGENT_ID` / `TOKEN`         | Credentials                            |
+| `INTRATUN_AGENT_DIAL_TIMEOUT_MS`      | TCP dial timeout (ms)                  |
+| `INTRATUN_AGENT_READ_BUFFER`          | Stream read buffer bytes               |
+| `INTRATUN_AGENT_WRITE_BUFFER`         | WebSocket write buffer bytes           |
+| `INTRATUN_AGENT_MAX_FRAME`            | Max payload per frame                  |
+| `INTRATUN_AGENT_MAX_INFLIGHT`         | Per-stream inflight bytes              |
+| `INTRATUN_AGENT_QUEUE_DEPTH`          | Per-stream queue depth                 |
+| `INTRATUN_AGENT_RECONNECT_MIN/MAX`    | Durations (e.g. `2s`, `30s`)           |
+
+### Relay
+
+| Variable                                   | Notes                                    |
+| ------------------------------------------ | ---------------------------------------- |
+| `INTRATUN_RELAY_CONFIG`                    | YAML config path                         |
+| `INTRATUN_RELAY_PROXY_LISTEN`              | HTTP CONNECT listener                    |
+| `INTRATUN_RELAY_SECURE_LISTEN`             | HTTPS listener                           |
+| `INTRATUN_RELAY_SOCKS_LISTEN`              | SOCKS5 listener                          |
+| `INTRATUN_RELAY_AGENT_CONFIG`              | Agents definition YAML                   |
+| `INTRATUN_RELAY_ACL_ALLOW`                 | Comma/space separated regex list         |
+| `INTRATUN_RELAY_MAX_FRAME`                 | Max frame payload size                   |
+| `INTRATUN_RELAY_MAX_INFLIGHT`              | Client backlog limit bytes               |
+| `INTRATUN_RELAY_STREAM_QUEUE_DEPTH`        | Client write queue depth                 |
+| `INTRATUN_RELAY_WS_IDLE`                   | WebSocket idle timeout (`45s`)           |
+| `INTRATUN_RELAY_DIAL_TIMEOUT_MS`           | Dial acknowledgement timeout             |
+| `INTRATUN_RELAY_ACME_HOSTS` / `EMAIL`      | ACME config                              |
+| `INTRATUN_RELAY_ACME_CACHE` / `ACME_HTTP`  | ACME cache/HTTP-01 endpoint              |
+| `INTRATUN_RELAY_STREAM_ID_MODE`            | `uuid` (default) or `cuid`               |
+
+Sample YAML snippets live in `config/`.
+
+---
+
 ## Command Reference
 
 ### Relay Flags
@@ -147,6 +214,12 @@ The agent reconnects automatically with exponential backoff and resolves DNS ins
 | `--max-frame`                | Max chunk size to relay           |
 | `--read-buf` / `--write-buf` | Socket and WebSocket buffer sizes |
 | `--max-inflight`             | Per-stream backpressure limit     |
+
+## Observability
+
+- Structured logs now include `service`, `component`, `trace_id`, and `span_id`. Use `INTRATUN_LOG_LEVEL` / `INTRATUN_JSON_LOGS` for formatting.
+- Enable tracing with `INTRATUN_TRACE_ENABLED=true` (default exporter prints OTLP spans to stdout). Point `INTRATUN_TRACE_EXPORTER` to future OTLP exporters when available.
+- Prometheus metrics remain exposed on the relay at `/metrics`.
 
 ## Dashboard & Monitoring
 

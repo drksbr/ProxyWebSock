@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/drksbr/ProxyWebSock/internal/logger"
 	"github.com/drksbr/ProxyWebSock/internal/util/bytelimiter"
 )
 
@@ -25,6 +26,7 @@ type agentStream struct {
 	writeQueue    chan streamWriteRequest
 	writerOnce    sync.Once
 	logger        *slog.Logger
+	spanID        string
 	closed        chan struct{}
 	closeOnce     sync.Once
 	queueClosed   atomic.Bool
@@ -55,10 +57,11 @@ func releaseAgentBuffer(buf []byte) {
 	}
 }
 
-func newAgentStream(id string, conn net.Conn, maxInFlight, queueDepth int, logger *slog.Logger) *agentStream {
-	streamLogger := logger
+func newAgentStream(id string, conn net.Conn, maxInFlight, queueDepth int, baseLogger *slog.Logger) *agentStream {
+	spanID := logger.NewSpanID()
+	streamLogger := baseLogger
 	if streamLogger != nil {
-		streamLogger = streamLogger.With("stream", id)
+		streamLogger = streamLogger.With("stream", id, "span_id", spanID)
 	}
 	as := &agentStream{
 		id:            id,
@@ -67,6 +70,7 @@ func newAgentStream(id string, conn net.Conn, maxInFlight, queueDepth int, logge
 		inboundLimit:  bytelimiter.New(maxInFlight),
 		writeQueue:    make(chan streamWriteRequest, queueDepth),
 		logger:        streamLogger,
+		spanID:        spanID,
 		closed:        make(chan struct{}),
 	}
 	as.startWriter()

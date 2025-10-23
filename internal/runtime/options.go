@@ -1,50 +1,61 @@
 package runtime
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
+
+	"github.com/drksbr/ProxyWebSock/internal/logger"
+	"github.com/drksbr/ProxyWebSock/internal/observability"
+	"github.com/drksbr/ProxyWebSock/internal/version"
 )
 
 type Options struct {
-	JSONLogs bool
-	LogLevel string
-	PIDFile  string
+	JSONLogs      bool
+	LogLevel      string
+	PIDFile       string
+	Service       string
+	Env           string
+	TraceEnabled  bool
+	TraceExporter string
+	TraceEndpoint string
+	TraceInsecure bool
 
-	logger      *slog.Logger
-	cleanupFns  []func()
-	pidFileOnce bool
+	logger        *logger.Logger
+	cleanupFns    []func()
+	pidFileOnce   bool
+	traceShutdown func(context.Context) error
 }
 
 func (o *Options) SetupLogger() error {
-	level := slog.LevelInfo
-	switch o.LogLevel {
-	case "", "info":
-		level = slog.LevelInfo
-	case "debug":
-		level = slog.LevelDebug
-	case "warn", "warning":
-		level = slog.LevelWarn
-	case "error":
-		level = slog.LevelError
-	default:
-		return fmt.Errorf("unknown log level %q", o.LogLevel)
+	if o.logger != nil {
+		return nil
 	}
-
-	var handler slog.Handler = slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level})
+	cfg := logger.Config{
+		Level:       o.LogLevel,
+		Format:      logger.FormatText,
+		ServiceName: o.Service,
+		Environment: o.Env,
+		Version:     version.Version,
+	}
 	if o.JSONLogs {
-		handler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})
+		cfg.Format = logger.FormatJSON
 	}
-	o.logger = slog.New(handler)
+	lg, err := logger.New(cfg)
+	if err != nil {
+		return err
+	}
+	o.logger = lg
 	return nil
 }
 
-func (o *Options) Logger() *slog.Logger {
+func (o *Options) Logger() *logger.Logger {
 	return o.logger
 }
 
@@ -101,4 +112,33 @@ func (o *Options) Cleanup() {
 		}
 	}
 	o.cleanupFns = nil
+}
+
+func (o *Options) SetupTracing(ctx context.Context) error {
+	if !o.TraceEnabled {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	shutdown, err := observability.InitTracing(ctx, observability.TracingConfig{
+		Enabled:     o.TraceEnabled,
+		Exporter:    o.TraceExporter,
+		ServiceName: o.Service,
+		Environment: o.Env,
+		Endpoint:    o.TraceEndpoint,
+		Insecure:    o.TraceInsecure,
+	})
+	if err != nil {
+		return err
+	}
+	shutdownFunc := shutdown
+	o.RegisterCleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if shutdownErr := shutdownFunc(shutdownCtx); shutdownErr != nil && o.logger != nil {
+			o.logger.Warn("trace shutdown", "error", shutdownErr)
+		}
+	})
+	return nil
 }

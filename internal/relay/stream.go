@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	logctx "github.com/drksbr/ProxyWebSock/internal/logger"
 	"github.com/drksbr/ProxyWebSock/internal/protocol"
 	"github.com/drksbr/ProxyWebSock/internal/util/bytelimiter"
 )
@@ -85,6 +86,7 @@ type relayStream struct {
 	handshake  chan struct{}
 	bytesUp    atomic.Int64
 	bytesDown  atomic.Int64
+	spanID     string
 
 	writeQueue         chan relayWriteRequest
 	writerOnce         sync.Once
@@ -95,7 +97,14 @@ type relayStream struct {
 }
 
 func newRelayStream(id string, agent *relayAgentSession, proto streamProtocol, client net.Conn, bufrw *bufio.ReadWriter, host string, port int, queueDepth int) *relayStream {
-	streamLogger := agent.server.logger.With("agent", agent.id, "stream", id)
+	spanID := logctx.NewSpanID()
+	streamLogger := agent.logger
+	if streamLogger == nil {
+		streamLogger = agent.server.logger
+	}
+	if streamLogger != nil {
+		streamLogger = streamLogger.With("stream", id, "span_id", spanID)
+	}
 	rs := &relayStream{
 		id:           id,
 		agent:        agent,
@@ -111,6 +120,7 @@ func newRelayStream(id string, agent *relayAgentSession, proto streamProtocol, c
 		writeQueue:   make(chan relayWriteRequest, queueDepth),
 		backlogLimit: bytelimiter.New(agent.server.opts.maxInFlight),
 		logger:       streamLogger,
+		spanID:       spanID,
 	}
 	rs.startWriter()
 	return rs
