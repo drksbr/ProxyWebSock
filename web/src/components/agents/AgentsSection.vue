@@ -213,7 +213,7 @@ function agentCardClasses(agent: StatusAgent): string {
             </span>
           </div>
         </button>
-        <div v-if="isExpanded(agent.id)" class="space-y-4 px-5 py-4">
+        <div v-if="isExpanded(agent.id)" class="space-y-2 px-5 py-4">
           <div class="grid gap-2 text-sm text-slate-300 md:grid-cols-2 lg:grid-cols-3">
             <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
               <div class="text-xs uppercase tracking-wide text-slate-500">
@@ -411,51 +411,68 @@ function agentCardClasses(agent: StatusAgent): string {
             </div>
           </div>
 
-          <div v-if="agent.streams?.length">
-            <div v-if="streamsForDisplay(agent).length" class="overflow-x-auto">
-              <table class="min-w-full divide-y divide-slate-800 text-sm">
-                <thead class="text-slate-400">
-                  <tr>
-                    <th class="px-3 py-2 text-left font-medium">Stream ID</th>
-                    <th class="px-3 py-2 text-left font-medium">Destino</th>
-                    <th class="px-3 py-2 text-left font-medium">Protocolo</th>
-                    <th class="px-3 py-2 text-left font-medium">Criada</th>
-                    <th class="px-3 py-2 text-left font-medium">⬆ Bytes</th>
-                    <th class="px-3 py-2 text-left font-medium">⬇ Bytes</th>
-                  </tr>
-                </thead>
-                <tbody class="divide-y divide-slate-800">
-                  <tr v-for="stream in streamsForDisplay(agent)" :key="stream.streamId" class="hover:bg-slate-900/80">
-                    <td class="px-3 py-2 font-mono text-xs text-slate-200">
-                      {{ stream.streamId }}
-                    </td>
-                    <td class="px-3 py-2 font-mono text-xs text-slate-300">
-                      {{ stream.target }}
-                    </td>
-                    <td class="px-3 py-2 uppercase text-slate-200">
-                      {{ stream.protocol }}
-                    </td>
-                    <td class="px-3 py-2 text-slate-300">
-                      {{ formatRelative(stream.createdAt) }}
-                    </td>
-                    <td class="px-3 py-2 text-slate-300">
-                      {{ formatBytes(stream.bytesUp) }}
-                    </td>
-                    <td class="px-3 py-2 text-slate-300">
-                      {{ formatBytes(stream.bytesDown) }}
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
+          <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-4">
+            <div class="text-xs uppercase tracking-wide text-slate-500 mb-2">
+              Streams ativas
+            </div>
+            <div v-if="agent.streams?.length">
+              <div v-if="streamsForDisplay(agent).length" class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-slate-800 text-sm">
+                  <thead class="text-slate-400">
+                    <tr>
+                      <th class="px-3 py-2 text-left font-medium">Stream ID</th>
+                      <th class="px-3 py-2 text-left font-medium">Destino</th>
+                      <th class="px-3 py-2 text-left font-medium">Protocolo</th>
+                      <th class="px-3 py-2 text-left font-medium">Criada</th>
+                      <th class="px-3 py-2 text-left font-medium">⬆</th>
+                      <th class="px-3 py-2 text-left font-medium">⬇</th>
+                      <th class="px-3 py-2 text-left font-medium">Fila ⬇</th>
+                      <!-- <th class="px-3 py-2 text-left font-medium">Chunks em fila</th> -->
+                      <!-- <th class="px-3 py-2 text-left font-medium">Limite fila</th> -->
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-slate-800">
+                    <tr v-for="stream in streamsForDisplay(agent)" :key="stream.streamId" class="hover:bg-slate-900/80">
+                      <td class="px-3 py-2 font-mono text-xs text-slate-200">
+                        {{ stream.streamId }}
+                      </td>
+                      <td class="px-3 py-2 font-mono text-xs text-slate-300">
+                        {{ stream.target }}
+                      </td>
+                      <td class="px-3 py-2 uppercase text-xs text-slate-200">
+                        {{ stream.protocol }}
+                      </td>
+                      <td class="px-3 py-2 text-xs text-slate-300">
+                        {{ formatRelative(stream.createdAt) }}
+                      </td>
+                      <td class="px-3 py-2 text-xs text-slate-300">
+                        {{ formatBytes(stream.bytesUp) }}
+                      </td>
+                      <td class="px-3 py-2 text-xs text-slate-300">
+                        {{ formatBytes(stream.bytesDown) }}
+                      </td>
+                      <td class="px-3 py-2 text-xs text-slate-300">
+                        {{ formatBytes(stream.pendingClientBytes ?? 0) }}
+                      </td>
+                      <!-- <td class="px-3 py-2 text-xs text-slate-300">
+                        {{ formatCount(stream.pendingClientChunks ?? 0) }}
+                      </td> -->
+                      <!-- <td class="px-3 py-2 text-xs text-slate-300">
+                        {{ formatBytes(stream.clientBacklogLimit ?? 0) }}
+                      </td> -->
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <div v-else
+                class="rounded-lg border border-dashed border-slate-800 bg-slate-900/80 p-4 text-sm text-slate-400">
+                Nenhum destino correspondente.
+              </div>
             </div>
             <div v-else
               class="rounded-lg border border-dashed border-slate-800 bg-slate-900/80 p-4 text-sm text-slate-400">
-              Nenhum destino correspondente.
+              Nenhum fluxo ativo
             </div>
-          </div>
-          <div v-else
-            class="rounded-lg border border-dashed border-slate-800 bg-slate-900/80 p-4 text-sm text-slate-400">
-            Nenhum fluxo ativo
           </div>
         </div>
       </article>

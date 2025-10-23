@@ -17,6 +17,9 @@ export type StatusStream = {
   createdAt: string;
   bytesUp: number;
   bytesDown: number;
+  pendingClientBytes?: number;
+  pendingClientChunks?: number;
+  clientBacklogLimit?: number;
 };
 
 export type StatusAgent = {
