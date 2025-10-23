@@ -7,8 +7,9 @@ scrape_configs:
     scheme: https
     tls_config:
       insecure_skip_verify: true
+      server_name: relay.neurocirurgiahgrs.com.br
     static_configs:
-      - targets: ["relay:443"]
+      - targets: ["relay.neurocirurgiahgrs.com.br:443"]
     metrics_path: /metrics
 
   - job_name: otel-collector

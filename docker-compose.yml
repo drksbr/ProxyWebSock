@@ -33,17 +33,22 @@ services:
     ports:
       - "8080:8080" # HTTP CONNECT
       - "443:443" # Web dashboard, metrics, /tunnel
+      - "80:80" # ACME HTTP-01 challenges
       - "1080:1080" # SOCKS5
     depends_on:
       - otel-collector
     networks:
-      - intratun
-      - observability
+      intratun:
+        aliases:
+          - relay.neurocirurgiahgrs.com.br
+      observability:
+        aliases:
+          - relay.neurocirurgiahgrs.com.br
 
   agent:
-    extends:
-      service: relay
+    image: intratun:latest          # usa a mesma imagem, não precisa rebuild
     container_name: intratun-agent
+    restart: unless-stopped         # opcional
     profiles:
       - agent
     command:
@@ -66,10 +71,11 @@ services:
     extra_hosts:
       - "relay.local:host-gateway"
     depends_on:
-      - relay
+      - intratun-relay
     networks:
       - intratun
       - observability
+
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.100.0
