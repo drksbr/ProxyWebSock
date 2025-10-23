@@ -8,13 +8,15 @@ services:
     container_name: intratun-relay
     command:
       - relay
+      - --agent-config ./config/agents.example.yaml
+      - --stream-id-mode=cuid
       - --proxy-listen=:8080
-      - --secure-listen=:8443
+      - --secure-listen=:443
       - --socks-listen=:1080
-      - --agent-config=/config/agents.yaml
-      - --acl-allow=^.*:443$
-      - --max-frame=32768
-      - --stream-queue-depth=2048
+      - --acme-host=relay.neurocirurgiahgrs.com.br
+      - --acme-email=admin@ncr.com.br
+      - --acme-cache=/var/lib/intratun/acme
+      - --acme-http=:80
       - --log-level=debug
     environment:
       - TZ=UTC
@@ -28,9 +30,9 @@ services:
     volumes:
       - ./config/agents.example.yaml:/config/agents.yaml:ro
     ports:
-      - "8080:8080"   # HTTP CONNECT
-      - "8443:8443"   # Web dashboard, metrics, /tunnel
-      - "1080:1080"   # SOCKS5
+      - "8080:8080" # HTTP CONNECT
+      - "443:443" # Web dashboard, metrics, /tunnel
+      - "1080:1080" # SOCKS5
     depends_on:
       - otel-collector
     networks:
@@ -44,10 +46,13 @@ services:
       - agent
     command:
       - agent
-      - --relay=wss://relay.local:8443/tunnel
-      - --id=intra
-      - --token=changeme
-      - --dial-timeout-ms=5000
+      - --relay=wss://relay.neurocirurgiahgrs.com.br/tunnel
+      - --id=agente01
+      - --token=troque-esta-senha
+      - --dial-timeout-ms=30000
+      - --max-frame=8192
+      - --read-buf=16384
+      - --write-buf=16384
       - --log-level=debug
     environment:
       - TZ=UTC
@@ -71,9 +76,9 @@ services:
     volumes:
       - ./observability/otel-collector/config.yaml:/etc/otel-collector/config.yaml:ro
     ports:
-      - "4317:4317"   # OTLP gRPC
-      - "4318:4318"   # OTLP HTTP
-      - "8889:8889"   # Prometheus exporter
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
+      - "8889:8889" # Prometheus exporter
     depends_on:
       - tempo
     networks:
