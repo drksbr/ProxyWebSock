@@ -26,7 +26,7 @@ services:
       - INTRATUN_TRACE_ENDPOINT=otel-collector:4317
       - INTRATUN_TRACE_INSECURE=true
       - INTRATUN_RELAY_ACME_HOST=relay.local
-      - INTRATUN_RELAY_ACME_EMAIL=ops@example.com
+      - INTRATUN_RELAY_ACME_EMAIL=admin@ncr.com.br
     volumes:
       - ./acme-cache:/var/lib/intratun/acme
       - ./config/agents.example.yaml:/config/agents.yaml:ro
