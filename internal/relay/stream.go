@@ -294,12 +294,6 @@ func (s *relayStream) writeToClient(data []byte) error {
 		}
 		releaseRelayBuffer(buf)
 		return errClientStreamClosed
-	default:
-		if s.backlogLimit != nil {
-			s.backlogLimit.Release(size)
-		}
-		releaseRelayBuffer(buf)
-		return errClientBacklog
 	}
 }
 

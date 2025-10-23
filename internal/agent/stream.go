@@ -112,16 +112,6 @@ func (s *agentStream) enqueueInbound(data []byte) error {
 		}
 		releaseAgentBuffer(buf)
 		return errStreamClosed
-	default:
-		if s.inboundLimit != nil {
-			s.inboundLimit.Release(size)
-		}
-		if s.logger != nil {
-			s.logger.Warn("inbound write queue overflow, closing stream")
-		}
-		releaseAgentBuffer(buf)
-		s.close()
-		return errStreamClosed
 	}
 }
 

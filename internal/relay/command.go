@@ -42,7 +42,7 @@ func NewCommand(globals *runtime.Options) *cobra.Command {
 		socksListen:      "",
 		maxFrame:         32 * 1024,
 		maxInFlight:      256 * 1024,
-		streamQueueDepth: 128,
+		streamQueueDepth: 1024,
 		wsIdle:           45 * time.Second,
 		dialTimeoutMs:    10000,
 		acmeHTTPAddr:     "",
