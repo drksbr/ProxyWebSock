@@ -18,6 +18,10 @@ GO_FILES := $(shell find . -type f -name '*.go' -not -path './web/node_modules/*
 GOLANGCI_LINT := $(shell command -v golangci-lint 2>/dev/null)
 GOTESTSUM := $(shell command -v gotestsum 2>/dev/null)
 
+RELAY_ARGS := relay --agent-config ./config/agents.example.yaml --stream-id-mode=cuid --proxy-listen=:8080 --secure-listen=:443 --socks-listen=:1080 --acme-host=relay.neurocirurgiahgrs.com.br --acme-email=admin@ncr.com.br --acme-cache=/var/lib/intratun/acme --acme-http=:80 --log-level=error
+AGENT_ARGS := agent --relay=wss://relay.neurocirurgiahgrs.com.br/tunnel --id=agente01 --token=troque-esta-senha --dial-timeout-ms=30000 --max-frame=8192 --read-buf=16384 --write-buf=16384 --log-level=error
+
+
 .DEFAULT_GOAL := build
 
 ifeq ($(PM),bun)
@@ -133,17 +137,17 @@ update:
 clean:
 	@rm -rf $(BIN_DIR) $(ARTIFACT_DIR)
 
-run-relay: build
-	$(BINARY) relay --agent-config ./config/agents.example.yaml --stream-id-mode=cuid --proxy-listen=:8080 --secure-listen=:8443 --log-level=info
+run-relay:
+	$(BINARY) $(RELAY_ARGS)
 
 run-relay-debug: build
-	$(BINARY) relay --agent-config ./config/agents.example.yaml --stream-id-mode=cuid --proxy-listen=:8080 --secure-listen=:8443 --log-level=debug
+	$(BINARY) $(RELAY_ARGS) --log-level=debug
 
 run-agent: build
-	$(BINARY) agent --relay=wss://relay.example.com/tunnel --id=example --token=CHANGE_ME
+	$(BINARY) $(AGENT_ARGS)
 
 run-agent-debug: build
-	$(BINARY) agent --relay=wss://relay.example.com/tunnel --id=example --token=CHANGE_ME --log-level=debug
+	$(BINARY) $(AGENT_ARGS) --log-level=debug
 
 relay-start: build
 	@mkdir -p $(BIN_DIR)
