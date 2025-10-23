@@ -41,7 +41,8 @@ services:
       - observability
 
   agent:
-    image: intratun:latest
+    extends:
+      service: relay
     container_name: intratun-agent
     profiles:
       - agent
