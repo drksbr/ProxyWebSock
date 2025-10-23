@@ -88,7 +88,6 @@ type relayStream struct {
 
 	writeQueue         chan relayWriteRequest
 	writerOnce         sync.Once
-	writerDone         chan struct{}
 	backlogLimit       *bytelimiter.ByteLimiter
 	pendingClientBytes atomic.Int64
 	logger             *slog.Logger
@@ -110,7 +109,6 @@ func newRelayStream(id string, agent *relayAgentSession, proto streamProtocol, c
 		readyCh:      make(chan error, 1),
 		handshake:    make(chan struct{}),
 		writeQueue:   make(chan relayWriteRequest, queueDepth),
-		writerDone:   make(chan struct{}),
 		backlogLimit: bytelimiter.New(agent.server.opts.maxInFlight),
 		logger:       streamLogger,
 	}
@@ -125,7 +123,6 @@ func (s *relayStream) startWriter() {
 }
 
 func (s *relayStream) writerLoop() {
-	defer close(s.writerDone)
 	for {
 		select {
 		case req, ok := <-s.writeQueue:
@@ -319,10 +316,6 @@ func (s *relayStream) shutdown(notifyAgent bool, err error) {
 		s.queueClosed.Store(true)
 		if s.writeQueue != nil {
 			close(s.writeQueue)
-		}
-		// Wait for writerLoop to finish processing all pending data
-		if s.writerDone != nil {
-			<-s.writerDone
 		}
 		if s.backlogLimit != nil {
 			s.backlogLimit.Close()

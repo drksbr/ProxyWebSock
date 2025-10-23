@@ -24,7 +24,6 @@ type agentStream struct {
 	inboundLimit  *bytelimiter.ByteLimiter
 	writeQueue    chan streamWriteRequest
 	writerOnce    sync.Once
-	writerDone    chan struct{}
 	logger        *slog.Logger
 	closed        chan struct{}
 	closeOnce     sync.Once
@@ -67,7 +66,6 @@ func newAgentStream(id string, conn net.Conn, maxInFlight, queueDepth int, logge
 		outboundLimit: bytelimiter.New(maxInFlight),
 		inboundLimit:  bytelimiter.New(maxInFlight),
 		writeQueue:    make(chan streamWriteRequest, queueDepth),
-		writerDone:    make(chan struct{}),
 		logger:        streamLogger,
 		closed:        make(chan struct{}),
 	}
@@ -118,7 +116,6 @@ func (s *agentStream) enqueueInbound(data []byte) error {
 }
 
 func (s *agentStream) writerLoop() {
-	defer close(s.writerDone)
 	for {
 		select {
 		case req, ok := <-s.writeQueue:
@@ -160,10 +157,6 @@ func (s *agentStream) close() {
 		close(s.closed)
 		s.queueClosed.Store(true)
 		close(s.writeQueue)
-		// Wait for writerLoop to finish processing all pending data
-		if s.writerDone != nil {
-			<-s.writerDone
-		}
 		s.conn.Close()
 		if s.outboundLimit != nil {
 			s.outboundLimit.Close()
