@@ -28,6 +28,7 @@ services:
       - INTRATUN_RELAY_ACME_HOST=relay.local
       - INTRATUN_RELAY_ACME_EMAIL=ops@example.com
     volumes:
+      - ./acme-cache:/var/lib/intratun/acme
       - ./config/agents.example.yaml:/config/agents.yaml:ro
     ports:
       - "8080:8080" # HTTP CONNECT
@@ -164,6 +165,7 @@ volumes:
   grafana-data:
   tempo-data:
   loki-data:
+  # host bind used above for ACME cache
 
 networks:
   intratun: {}
