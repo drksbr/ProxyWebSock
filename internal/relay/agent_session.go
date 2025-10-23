@@ -59,21 +59,22 @@ type relayAgentSession struct {
 	writerStarted bool
 	writerClose   sync.Once
 
-	heartbeatMu          sync.Mutex
-	lastHeartbeat        time.Time
-	latency              time.Duration
-	jitter               time.Duration
-	heartbeatSeq         uint64
-	heartbeatFailures    int
-	lastHeartbeatError   string
-	lastHeartbeatErrorAt time.Time
-	heartbeatSendDelay   time.Duration
-	heartbeatPending     int
-	agentControlQueue    int
-	agentDataQueue       int
-	agentCPU             float64
-	agentRSS             uint64
-	agentGoroutines      int
+	heartbeatMu           sync.Mutex
+	lastHeartbeat         time.Time
+	latency               time.Duration
+	jitter                time.Duration
+	heartbeatSeq          uint64
+	heartbeatFailures     int
+	lastHeartbeatError    string
+	lastHeartbeatErrorAt  time.Time
+	heartbeatSendDelay    time.Duration
+	heartbeatPending      int
+	agentControlQueue     int
+	agentDataQueue        int
+	agentCPU              float64
+	agentRSS              uint64
+	agentGoroutines       int
+	agentResourcesSampled bool
 
 	errorMu     sync.Mutex
 	errorCount  int64
@@ -608,6 +609,9 @@ func (s *relayAgentSession) updateHeartbeatFromAgent(payload *protocol.Heartbeat
 		s.agentCPU = payload.Stats.CPUPercent
 		s.agentRSS = payload.Stats.RSSBytes
 		s.agentGoroutines = payload.Stats.Goroutines
+		if payload.Stats.CPUPercent != 0 || payload.Stats.RSSBytes != 0 || payload.Stats.Goroutines != 0 {
+			s.agentResourcesSampled = true
+		}
 		if payload.Stats.LastError != "" {
 			s.lastHeartbeatError = payload.Stats.LastError
 			if payload.Stats.LastErrorAt != 0 {
@@ -693,6 +697,7 @@ func (s *relayAgentSession) snapshot() statusAgent {
 	cpu := s.agentCPU
 	rss := s.agentRSS
 	goroutines := s.agentGoroutines
+	sampled := s.agentResourcesSampled
 	s.heartbeatMu.Unlock()
 
 	if lastHeartbeat.IsZero() {
@@ -716,14 +721,13 @@ func (s *relayAgentSession) snapshot() statusAgent {
 	if pending > 0 {
 		agent.HeartbeatPending = pending
 	}
-	if cpu > 0 {
-		agent.AgentCPUPercent = cpu
-	}
-	if rss > 0 {
-		agent.AgentRSSBytes = rss
-	}
-	if goroutines > 0 {
-		agent.AgentGoroutines = goroutines
+	if sampled {
+		cpuCopy := cpu
+		rssCopy := rss
+		goroutinesCopy := goroutines
+		agent.AgentCPUPercent = &cpuCopy
+		agent.AgentRSSBytes = &rssCopy
+		agent.AgentGoroutines = &goroutinesCopy
 	}
 
 	s.errorMu.Lock()
