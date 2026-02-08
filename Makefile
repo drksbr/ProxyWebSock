@@ -127,6 +127,7 @@ release: clean web-build
 	@GOOS=linux GOARCH=amd64 $(GO) build -o $(BIN_DIR)/intratun-linux-amd64 $(CMD)
 	@GOOS=linux GOARCH=arm64 $(GO) build -o $(BIN_DIR)/intratun-linux-arm64 $(CMD)
 	@GOOS=darwin GOARCH=arm64 $(GO) build -o $(BIN_DIR)/intratun-darwin-arm64 $(CMD)
+	@GOOS=windows GOARCH=amd64 $(GO) build -o $(BIN_DIR)/intratun-windows-amd64.exe $(CMD)
 
 profiles: bench-profile
 
