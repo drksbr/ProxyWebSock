@@ -18,16 +18,21 @@ import (
 	"golang.org/x/net/proxy"
 )
 
+type UpstreamRewrite struct {
+	Host        string // ex: aghuse.saude.ba.gov.br
+	Origin      string // ex: https://aghuse.saude.ba.gov.br
+	RefererBase string // ex: https://aghuse.saude.ba.gov.br/aghu/
+}
+
 func main() {
 	wd, _ := os.Getwd()
 	log.Printf("WD=%s", wd)
 
-	// Carrega .env do diretório atual e SOBRESCREVE variáveis já existentes no ambiente
 	if err := godotenv.Overload(".env"); err != nil {
 		log.Println("⚠️  .env não encontrado neste diretório; usando variáveis do sistema")
 	}
 
-	// Upstream base: SEM path (importante para evitar duplicação de /aghu)
+	// Upstream base (SEM path)
 	targetStr := mustEnv("INTRANET_TARGET_URL") // ex: https://aghuse.saude.ba.gov.br
 	targetURL, err := url.Parse(targetStr)
 	if err != nil {
@@ -38,20 +43,36 @@ func main() {
 	}
 	targetURL.Path, targetURL.RawPath, targetURL.RawQuery, targetURL.Fragment = "", "", "", ""
 
-	// Base interna completa (inclui /aghu/) usada para reescrever redirects/cookies
+	// Base interna completa (inclui /aghu/) para rewrite de Location/cookies
 	internalBaseURL := mustURL("INTERNAL_BASE_URL") // ex: https://aghuse.saude.ba.gov.br/aghu/
 
-	// Contexto que deve existir no upstream (ex.: /aghu)
-	// Se não setar, default "/aghu"
-	upstreamContext := envOr("UPSTREAM_CONTEXT_PATH", "/aghu")
-	upstreamContext = normalizeContextPath(upstreamContext)
+	// Contexto do app no upstream
+	upstreamContext := normalizeContextPath(envOr("UPSTREAM_CONTEXT_PATH", "/aghu"))
+
+	// Opcional: forçar o que o upstream “enxerga”
+	rew := UpstreamRewrite{
+		Host:        strings.TrimSpace(os.Getenv("UPSTREAM_HOST")),
+		Origin:      strings.TrimSpace(os.Getenv("UPSTREAM_ORIGIN")),
+		RefererBase: strings.TrimSpace(os.Getenv("UPSTREAM_REFERER_BASE")),
+	}
+	if rew.Host == "" {
+		rew.Host = targetURL.Hostname()
+	}
+	if rew.Origin == "" {
+		rew.Origin = targetURL.Scheme + "://" + rew.Host
+	}
+	if rew.RefererBase == "" {
+		// base default: https://<host>/aghu/
+		rew.RefererBase = rew.Origin + upstreamContext + "/"
+	}
+	rew.RefererBase = ensureTrailingSlash(rew.RefererBase)
 
 	// SOCKS5
 	socksAddr := mustEnv("SOCKS5_ADDR")
 	socksUser := envOr("SOCKS5_USER", "")
 	socksPass := envOr("SOCKS5_PASS", "")
 
-	// Auth pública
+	// Auth pública (para seu daemon)
 	publicUser := mustEnv("PUBLIC_USER")
 	publicPass := mustEnv("PUBLIC_PASS")
 
@@ -66,17 +87,18 @@ func main() {
 		log.Fatalf("falha ao configurar SOCKS5: %v", err)
 	}
 
-	// Handler cria um proxy por request (thread-safe) e usa base pública dinâmica
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		publicBase := publicBaseFromRequest(r)
-		rp := newReverseProxy(targetURL, transport, internalBaseURL, publicBase, upstreamContext)
+
+		// Proxy por request (thread-safe)
+		rp := newReverseProxy(targetURL, transport, internalBaseURL, publicBase, upstreamContext, rew)
 
 		withBasicAuth(rp, publicUser, publicPass).ServeHTTP(w, r)
 	})
 
 	addr := envOr("LISTEN_ADDR", ":8081")
-	log.Printf("listening on %s -> %s via SOCKS5 %s", addr, targetURL.String(), socksAddr)
-	log.Printf("internal base: %s | upstream context: %s | public base: dinâmico por request", internalBaseURL.String(), upstreamContext)
+	log.Printf("listening on %s (public) -> %s (upstream) via SOCKS5 %s", addr, targetURL.String(), socksAddr)
+	log.Printf("upstream host mask: host=%s origin=%s refererBase=%s", rew.Host, rew.Origin, rew.RefererBase)
 
 	log.Fatal(http.ListenAndServe(addr, handler))
 }
@@ -87,39 +109,53 @@ func newReverseProxy(
 	internalBase *url.URL,
 	publicBase *url.URL,
 	upstreamContext string,
+	rew UpstreamRewrite,
 ) *httputil.ReverseProxy {
 	rp := httputil.NewSingleHostReverseProxy(targetURL)
 	rp.Transport = transport
 
 	originalDirector := rp.Director
 	rp.Director = func(req *http.Request) {
+		// Capture host/proto do cliente (público) antes de mexer no req
+		publicHost := req.Host
+		publicProto := "http"
+		if req.TLS != nil {
+			publicProto = "https"
+		}
+		if xfProto := strings.TrimSpace(req.Header.Get("X-Forwarded-Proto")); xfProto != "" {
+			publicProto = xfProto
+		}
+		if xfHost := strings.TrimSpace(req.Header.Get("X-Forwarded-Host")); xfHost != "" {
+			publicHost = xfHost
+		}
+
 		originalDirector(req)
 
-		// Força Host do upstream correto
-		req.Host = targetURL.Host
-
-		// ✅ FIX: garante que qualquer request pública sem /aghu seja enviada para /aghu no upstream
-		// Ex.: /pages/x.xhtml -> /aghu/pages/x.xhtml
+		// ✅ Contexto /aghu no upstream
 		req.URL.Path = ensureContext(req.URL.Path, upstreamContext)
 
-		// Encaminhamento padrão
-		req.Header.Set("X-Forwarded-For", clientIP(req))
+		// ✅ Host/SNI do upstream: aqui você decide se quer mascarar Host pro upstream
+		// - req.URL.Host já é o targetURL.Host (NewSingleHostReverseProxy)
+		// - req.Host controla o header Host enviado ao upstream
+		req.Host = rew.Host
 
-		// Preserva proto/host se vierem do LB (senão define)
-		if req.Header.Get("X-Forwarded-Proto") == "" {
-			if req.TLS != nil {
-				req.Header.Set("X-Forwarded-Proto", "https")
-			} else {
-				req.Header.Set("X-Forwarded-Proto", "http")
-			}
-		}
-		if req.Header.Get("X-Forwarded-Host") == "" {
-			req.Header.Set("X-Forwarded-Host", req.Host)
-		}
+		// ✅ Reescrita de headers sensíveis (muito comum em validação de login/CSRF)
+		rewriteOriginReferer(req, rew)
+
+		// ✅ X-Forwarded-* coerentes (o app pode usar isso)
+		req.Header.Set("X-Forwarded-For", clientIP(req))
+		req.Header.Set("X-Forwarded-Proto", publicProto)
+		req.Header.Set("X-Forwarded-Host", publicHost)
+
+		// Alguns servidores olham "Forwarded"
+		req.Header.Set("Forwarded", `for=`+clientIP(req)+`;proto=`+publicProto+`;host=`+publicHost)
+
+		// (Opcional) se o upstream reclamar de Accept-Encoding (debug), descomente:
+		// req.Header.Del("Accept-Encoding")
 	}
 
-	// Rewrite de redirects/cookies usando base pública dinâmica
 	rp.ModifyResponse = func(resp *http.Response) error {
+		// Redirects e cookies Domain para manter tudo no seu domínio público
 		rewriteLocation(resp, internalBase, publicBase)
 		rewriteSetCookieDomain(resp, internalBase.Hostname(), publicBase.Hostname())
 		return nil
@@ -133,15 +169,48 @@ func newReverseProxy(
 	return rp
 }
 
+func rewriteOriginReferer(req *http.Request, rew UpstreamRewrite) {
+	// Origin (POST do login geralmente tem)
+	if origin := req.Header.Get("Origin"); origin != "" {
+		req.Header.Set("Origin", rew.Origin)
+	}
+
+	// Referer (muitos frameworks checam)
+	if ref := req.Header.Get("Referer"); ref != "" {
+		// se o ref é público, troca a base pelo upstream
+		// Ex: https://aghuse.neurocirurgiahgrs.com.br/aghu/login.xhtml -> https://aghuse.saude.ba.gov.br/aghu/login.xhtml
+		req.Header.Set("Referer", mapPublicToUpstreamRef(ref, rew))
+	}
+
+	// Host já foi setado no Director (req.Host = rew.Host)
+}
+
+func mapPublicToUpstreamRef(ref string, rew UpstreamRewrite) string {
+	// tenta parsear e reconstruir no domínio do upstream mantendo path/query
+	u, err := url.Parse(ref)
+	if err != nil {
+		// fallback: aponta para referer base
+		return rew.RefererBase
+	}
+	// mantém o path/query do referer público, mas joga no host upstream
+	u.Scheme = "https"
+	u.Host = rew.Host
+	// garante que está sob /aghu (se vier sem)
+	if !strings.HasPrefix(u.Path, "/aghu/") && u.Path != "/aghu" {
+		u.Path = "/aghu" + u.Path
+	}
+	return u.String()
+}
+
+// --- Helpers de context/path/base
+
 func ensureContext(path, context string) string {
-	// context vem normalizado como "/aghu"
 	if path == "" || path == "/" {
 		return context + "/"
 	}
 	if path == context || strings.HasPrefix(path, context+"/") {
 		return path
 	}
-	// Se vier sem a barra inicial, normaliza
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
@@ -156,11 +225,17 @@ func normalizeContextPath(p string) string {
 	if !strings.HasPrefix(p, "/") {
 		p = "/" + p
 	}
-	// remove trailing slash
 	for len(p) > 1 && strings.HasSuffix(p, "/") {
 		p = strings.TrimSuffix(p, "/")
 	}
 	return p
+}
+
+func ensureTrailingSlash(s string) string {
+	if strings.HasSuffix(s, "/") {
+		return s
+	}
+	return s + "/"
 }
 
 func publicBaseFromRequest(r *http.Request) *url.URL {
@@ -172,14 +247,14 @@ func publicBaseFromRequest(r *http.Request) *url.URL {
 			scheme = "http"
 		}
 	}
-
 	host := strings.TrimSpace(r.Header.Get("X-Forwarded-Host"))
 	if host == "" {
 		host = r.Host
 	}
-
 	return &url.URL{Scheme: scheme, Host: host, Path: "/"}
 }
+
+// --- Redirect / Cookie rewrite
 
 func rewriteLocation(resp *http.Response, internalBase, publicBase *url.URL) {
 	loc := resp.Header.Get("Location")
@@ -187,14 +262,12 @@ func rewriteLocation(resp *http.Response, internalBase, publicBase *url.URL) {
 		return
 	}
 
-	// Caso 1: Location absoluto com a base interna completa (inclui /aghu/)
 	if strings.HasPrefix(loc, internalBase.String()) {
 		newLoc := publicBase.String() + strings.TrimPrefix(loc, internalBase.String())
 		resp.Header.Set("Location", newLoc)
 		return
 	}
 
-	// Caso 2: Location absoluto só com host interno
 	internalHostPrefix := internalBase.Scheme + "://" + internalBase.Host
 	if strings.HasPrefix(loc, internalHostPrefix) {
 		publicHostPrefix := publicBase.Scheme + "://" + publicBase.Host
@@ -202,8 +275,6 @@ func rewriteLocation(resp *http.Response, internalBase, publicBase *url.URL) {
 		resp.Header.Set("Location", newLoc)
 		return
 	}
-
-	// Caso 3: Location relativo (deixa como está)
 }
 
 func rewriteSetCookieDomain(resp *http.Response, internalDomain, publicDomain string) {
@@ -250,6 +321,8 @@ func replaceCookieDomain(setCookie, internalDomain, publicDomain string) string 
 	return setCookie
 }
 
+// --- SOCKS5 Transport
+
 func socks5Transport(addr, user, pass string, tlsCfg *tls.Config) (*http.Transport, error) {
 	var auth *proxy.Auth
 	if user != "" || pass != "" {
@@ -287,6 +360,8 @@ func socks5Transport(addr, user, pass string, tlsCfg *tls.Config) (*http.Transpo
 	}, nil
 }
 
+// --- TLS Upstream
+
 func buildUpstreamTLSConfig() (*tls.Config, error) {
 	insecure := strings.EqualFold(strings.TrimSpace(os.Getenv("UPSTREAM_INSECURE_SKIP_VERIFY")), "true")
 	caPath := strings.TrimSpace(os.Getenv("UPSTREAM_CA_PEM"))
@@ -322,6 +397,8 @@ func buildUpstreamTLSConfig() (*tls.Config, error) {
 	return cfg, nil
 }
 
+// --- Basic Auth (seu daemon)
+
 func withBasicAuth(next http.Handler, user, pass string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		u, p, ok := r.BasicAuth()
@@ -333,6 +410,8 @@ func withBasicAuth(next http.Handler, user, pass string) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
+// --- misc
 
 func mustEnv(k string) string {
 	v := strings.TrimSpace(os.Getenv(k))
