@@ -3,6 +3,7 @@ package protocol
 import (
 	"encoding/base64"
 	"fmt"
+	"io"
 	"sync"
 )
 
@@ -14,6 +15,7 @@ const (
 	FrameTypeWrite     FrameType = "write"
 	FrameTypeClose     FrameType = "close"
 	FrameTypeError     FrameType = "err"
+	FrameTypeWindow    FrameType = "window"
 	FrameTypeHeartbeat FrameType = "heartbeat"
 )
 
@@ -25,6 +27,7 @@ type Frame struct {
 	Host      string            `json:"host,omitempty"`
 	Port      int               `json:"port,omitempty"`
 	Payload   string            `json:"payload,omitempty"`
+	Window    int               `json:"window,omitempty"`
 	Error     string            `json:"error,omitempty"`
 	Heartbeat *HeartbeatPayload `json:"heartbeat,omitempty"`
 }
@@ -62,16 +65,16 @@ const maxPooledFrameSize = 1024 * 1024
 
 var binaryFramePool = sync.Pool{
 	New: func() any {
-		return make([]byte, 0, 64*1024)
+		return make([]byte, 0, 128*1024)
 	},
 }
 
 // EncodeBinaryFramePooled encodes the stream identifier and payload using a pooled backing buffer.
 // The caller MUST invoke the returned release function exactly once after the slice is no longer needed.
 func EncodeBinaryFramePooled(streamID string, payload []byte) ([]byte, func(), error) {
-	idLen := len(streamID)
-	if idLen == 0 || idLen > 255 {
-		return nil, nil, fmt.Errorf("invalid stream id length %d", idLen)
+	idLen, err := validateStreamID(streamID)
+	if err != nil {
+		return nil, nil, err
 	}
 	total := 1 + idLen + len(payload)
 	buf := borrowFrameBuffer(total)
@@ -116,6 +119,94 @@ func DecodeBinaryFrame(data []byte) (string, []byte, error) {
 	}
 	streamID := string(data[1 : 1+idLen])
 	return streamID, data[1+idLen:], nil
+}
+
+func WriteBinaryFrame(w io.Writer, streamID string, payload []byte) error {
+	idLen, err := validateStreamID(streamID)
+	if err != nil {
+		return err
+	}
+	var header [256]byte
+	headerSlice := header[:1+idLen]
+	header[0] = byte(idLen)
+	copy(headerSlice[1:], streamID)
+	if _, err := w.Write(headerSlice); err != nil {
+		return err
+	}
+	if len(payload) == 0 {
+		return nil
+	}
+	_, err = w.Write(payload)
+	return err
+}
+
+// ReadBinaryFramePooled reads and decodes a binary frame from r using a pooled backing buffer.
+// The returned release function MUST be called exactly once after the payload is no longer needed.
+func ReadBinaryFramePooled(r io.Reader, maxSize int) (string, []byte, func(), error) {
+	if r == nil {
+		return "", nil, nil, fmt.Errorf("binary frame reader is nil")
+	}
+	if maxSize <= 0 {
+		maxSize = maxPooledFrameSize
+	}
+	initialSize := 128 * 1024
+	if maxSize < initialSize {
+		initialSize = maxSize
+	}
+	buf := borrowFrameBuffer(initialSize)
+	length := 0
+
+	for {
+		if length == cap(buf) {
+			if length >= maxSize {
+				releaseFrameBuffer(buf)
+				return "", nil, nil, fmt.Errorf("binary frame exceeds limit %d", maxSize)
+			}
+			nextCap := cap(buf) * 2
+			if nextCap == 0 {
+				nextCap = initialSize
+			}
+			if nextCap > maxSize {
+				nextCap = maxSize
+			}
+			grown := make([]byte, length, nextCap)
+			copy(grown, buf[:length])
+			releaseFrameBuffer(buf)
+			buf = grown[:length]
+		}
+
+		readBuf := buf[:cap(buf)]
+		n, err := r.Read(readBuf[length:])
+		length += n
+		buf = readBuf[:length]
+		if err == nil {
+			continue
+		}
+		if err == io.EOF {
+			break
+		}
+		releaseFrameBuffer(buf)
+		return "", nil, nil, err
+	}
+
+	streamID, payload, err := DecodeBinaryFrame(buf)
+	if err != nil {
+		releaseFrameBuffer(buf)
+		return "", nil, nil, err
+	}
+
+	release := func() {
+		releaseFrameBuffer(buf)
+	}
+	return streamID, payload, release, nil
+}
+
+func validateStreamID(streamID string) (int, error) {
+	idLen := len(streamID)
+	if idLen == 0 || idLen > 255 {
+		return 0, fmt.Errorf("invalid stream id length %d", idLen)
+	}
+	return idLen, nil
 }
 
 type HeartbeatMode string

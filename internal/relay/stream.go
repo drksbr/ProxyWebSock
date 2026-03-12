@@ -40,9 +40,12 @@ var (
 	errClientBacklog      = errors.New("client backlog exceeded")
 )
 
+const backlogAcquireWait = 500 * time.Millisecond
+
 type relayWriteRequest struct {
-	data []byte
-	size int
+	data    []byte
+	size    int
+	release func()
 }
 
 const maxRelayPooledBuffer = 512 * 1024
@@ -90,13 +93,16 @@ type relayStream struct {
 
 	writeQueue         chan relayWriteRequest
 	writerOnce         sync.Once
+	sendWindow         *bytelimiter.ByteLimiter
 	backlogLimit       *bytelimiter.ByteLimiter
 	pendingClientBytes atomic.Int64
 	logger             *slog.Logger
 	queueClosed        atomic.Bool
+	windowUpdate       func(int) error
+	windowBatch        int
 }
 
-func newRelayStream(id string, agent *relayAgentSession, proto streamProtocol, client net.Conn, bufrw *bufio.ReadWriter, host string, port int, queueDepth int) *relayStream {
+func newRelayStream(id string, agent *relayAgentSession, proto streamProtocol, client net.Conn, bufrw *bufio.ReadWriter, host string, port int, queueDepth int, windowUpdate func(int) error) *relayStream {
 	spanID := logctx.NewSpanID()
 	streamLogger := agent.logger
 	if streamLogger == nil {
@@ -118,9 +124,12 @@ func newRelayStream(id string, agent *relayAgentSession, proto streamProtocol, c
 		readyCh:      make(chan error, 1),
 		handshake:    make(chan struct{}),
 		writeQueue:   make(chan relayWriteRequest, queueDepth),
+		sendWindow:   bytelimiter.New(agent.server.opts.maxInFlight),
 		backlogLimit: bytelimiter.New(agent.server.opts.maxInFlight),
 		logger:       streamLogger,
 		spanID:       spanID,
+		windowUpdate: windowUpdate,
+		windowBatch:  windowBatchSize(agent.server.opts.maxInFlight),
 	}
 	rs.startWriter()
 	return rs
@@ -133,49 +142,76 @@ func (s *relayStream) startWriter() {
 }
 
 func (s *relayStream) writerLoop() {
-	for {
-		select {
-		case req, ok := <-s.writeQueue:
-			if !ok {
-				return
+	pendingWindow := 0
+	flushWindow := func(force bool) {
+		if pendingWindow <= 0 || s.windowUpdate == nil {
+			return
+		}
+		if !force && pendingWindow < s.windowBatch {
+			return
+		}
+		if err := s.windowUpdate(pendingWindow); err != nil && s.logger != nil {
+			s.logger.Debug("window update failed", "error", err)
+		}
+		pendingWindow = 0
+	}
+	draining := false
+	for req := range s.writeQueue {
+		if req.size == 0 {
+			if req.release != nil {
+				req.release()
 			}
-			if req.size == 0 {
-				releaseRelayBuffer(req.data)
-				continue
-			}
-			total := 0
-			var writeErr error
-			for total < len(req.data) {
-				n, err := s.client.Write(req.data[total:])
-				if err != nil {
-					writeErr = err
-					break
-				}
-				total += n
-			}
-			if total > 0 {
-				s.bytesDown.Add(int64(total))
-				s.agent.server.metrics.bytesDownstream.Add(float64(total))
-				s.agent.server.stats.bytesDown.Add(int64(total))
-			}
+			continue
+		}
+		if draining || len(req.data) == 0 {
 			if s.backlogLimit != nil {
 				s.backlogLimit.Release(req.size)
 			}
-			releaseRelayBuffer(req.data)
+			if req.release != nil {
+				req.release()
+			}
 			newPending := s.pendingClientBytes.Add(-int64(req.size))
 			if newPending < 0 {
 				s.pendingClientBytes.Store(0)
 			}
-			if writeErr != nil {
-				if s.logger != nil {
-					s.logger.Debug("client write failed", "error", writeErr)
-				}
-				s.closeFromRelay(writeErr)
+			continue
+		}
+		total := 0
+		var writeErr error
+		for total < len(req.data) {
+			n, err := s.client.Write(req.data[total:])
+			if err != nil {
+				writeErr = err
+				break
 			}
-		case <-s.closing:
-			return
+			total += n
+		}
+		if total > 0 {
+			s.bytesDown.Add(int64(total))
+			s.agent.server.metrics.bytesDownstream.Add(float64(total))
+			s.agent.server.stats.bytesDown.Add(int64(total))
+		}
+		if s.backlogLimit != nil {
+			s.backlogLimit.Release(req.size)
+		}
+		pendingWindow += total
+		flushWindow(len(s.writeQueue) == 0)
+		if req.release != nil {
+			req.release()
+		}
+		newPending := s.pendingClientBytes.Add(-int64(req.size))
+		if newPending < 0 {
+			s.pendingClientBytes.Store(0)
+		}
+		if writeErr != nil {
+			if s.logger != nil {
+				s.logger.Debug("client write failed", "error", writeErr)
+			}
+			draining = true
+			s.closeFromRelay(writeErr)
 		}
 	}
+	flushWindow(true)
 }
 
 func (s *relayStream) accept() error {
@@ -235,16 +271,29 @@ func (s *relayStream) markReady(err error) {
 }
 
 func (s *relayStream) pipeClientOutbound() {
-	buffer := make([]byte, s.agent.server.opts.maxFrame)
+	buffer := borrowRelayBuffer(s.agent.server.opts.maxFrame)
+	defer func() {
+		if buffer != nil {
+			releaseRelayBuffer(buffer)
+		}
+	}()
 	for {
-		n, err := s.client.Read(buffer)
+		n, err := s.client.Read(buffer[:s.agent.server.opts.maxFrame])
 		if n > 0 {
-			chunk := buffer[:n]
-			if err := s.agent.sendBinary(s.id, chunk); err != nil {
+			if !s.acquire(n) {
+				return
+			}
+			sendBuf := buffer[:n]
+			buffer = nil
+			if err := s.agent.sendBinary(s.id, sendBuf, func() {
+				releaseRelayBuffer(sendBuf)
+			}); err != nil {
+				s.release(n)
 				s.agent.server.logger.Debug("send to agent failed", "agent", s.agent.id, "stream", s.id, "error", err)
 				s.closeFromRelay(err)
 				return
 			}
+			buffer = borrowRelayBuffer(s.agent.server.opts.maxFrame)
 			s.agent.server.metrics.bytesUpstream.Add(float64(n))
 			s.agent.server.stats.bytesUp.Add(int64(n))
 			s.bytesUp.Add(int64(n))
@@ -273,26 +322,50 @@ func (s *relayStream) writeToClient(data []byte) error {
 	if len(data) == 0 {
 		return nil
 	}
+	buf := borrowRelayBuffer(len(data))
+	copy(buf, data)
+	return s.writeToClientBuffer(buf, len(data), func() {
+		releaseRelayBuffer(buf)
+	})
+}
+
+func (s *relayStream) writeToClientBuffer(data []byte, size int, release func()) error {
+	if len(data) == 0 {
+		if release != nil {
+			release()
+		}
+		return nil
+	}
 	if s.isClosing() {
+		if release != nil {
+			release()
+		}
 		return errClientStreamClosed
 	}
 	if s.queueClosed.Load() {
+		if release != nil {
+			release()
+		}
 		return errClientStreamClosed
 	}
 	select {
 	case <-s.handshake:
 	case <-s.closing:
+		if release != nil {
+			release()
+		}
 		return errClientStreamClosed
 	}
-	size := len(data)
-	if s.backlogLimit != nil && !s.backlogLimit.TryAcquire(size) {
+	if !waitForRelayCapacity(s.backlogLimit, size, s.closing, backlogAcquireWait) {
+		if release != nil {
+			release()
+		}
 		return errClientBacklog
 	}
-	buf := borrowRelayBuffer(size)
-	copy(buf, data)
 	req := relayWriteRequest{
-		data: buf,
-		size: size,
+		data:    data,
+		size:    size,
+		release: release,
 	}
 	select {
 	case s.writeQueue <- req:
@@ -302,7 +375,9 @@ func (s *relayStream) writeToClient(data []byte) error {
 		if s.backlogLimit != nil {
 			s.backlogLimit.Release(size)
 		}
-		releaseRelayBuffer(buf)
+		if release != nil {
+			release()
+		}
 		return errClientStreamClosed
 	}
 }
@@ -329,6 +404,9 @@ func (s *relayStream) shutdown(notifyAgent bool, err error) {
 		}
 		if s.backlogLimit != nil {
 			s.backlogLimit.Close()
+		}
+		if s.sendWindow != nil {
+			s.sendWindow.Close()
 		}
 		s.pendingClientBytes.Store(0)
 		s.agent.removeStream(s.id)
@@ -373,5 +451,34 @@ func (s *relayStream) stats() statusStream {
 		PendingClientBytes:  pendingBytes,
 		PendingClientChunks: pendingChunks,
 		ClientBacklogLimit:  backlogLimit,
+	}
+}
+
+func (s *relayStream) acquire(n int) bool {
+	return waitForRelayCapacity(s.sendWindow, n, s.closing, -1)
+}
+
+func (s *relayStream) release(n int) {
+	if s.sendWindow != nil {
+		s.sendWindow.Release(n)
+	}
+}
+
+func waitForRelayCapacity(limit *bytelimiter.ByteLimiter, n int, closing <-chan struct{}, maxWait time.Duration) bool {
+	return limit.WaitAcquire(n, closing, maxWait)
+}
+
+func windowBatchSize(maxInFlight int) int {
+	switch {
+	case maxInFlight <= 0:
+		return 64 * 1024
+	case maxInFlight <= 64*1024:
+		return maxInFlight
+	case maxInFlight < 1024*1024:
+		return maxInFlight / 2
+	case maxInFlight < 8*1024*1024:
+		return 256 * 1024
+	default:
+		return 512 * 1024
 	}
 }

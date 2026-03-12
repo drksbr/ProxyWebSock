@@ -13,6 +13,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/drksbr/ProxyWebSock/internal/util"
 	"github.com/drksbr/ProxyWebSock/internal/version"
 )
 
@@ -21,6 +22,7 @@ type agent struct {
 	logger *slog.Logger
 	rngMu  sync.Mutex
 	rng    *rand.Rand
+	update sync.Mutex
 }
 
 func (o *options) run(ctx context.Context) error {
@@ -32,6 +34,9 @@ func (o *options) run(ctx context.Context) error {
 }
 
 func (a *agent) run(ctx context.Context) error {
+	if a.opts.updateParsedURL != nil {
+		go a.autoUpdateLoop(ctx)
+	}
 	backoff := a.opts.reconnectMin
 	for {
 		if ctx.Err() != nil {
@@ -114,6 +119,7 @@ func (a *agent) connectOnce(ctx context.Context) error {
 	if resp != nil && resp.Body != nil {
 		resp.Body.Close()
 	}
+	util.TuneTCPConn(conn.UnderlyingConn(), a.opts.readBuffer, a.opts.writeBuffer)
 
 	session := newSession(a, conn)
 	return session.run(ctx)

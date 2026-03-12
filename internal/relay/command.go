@@ -29,6 +29,7 @@ type relayOptions struct {
 	acmeEmail        string
 	acmeCache        string
 	acmeHTTPAddr     string
+	updatesDir       string
 	streamIDMode     string
 	configFile       string
 }
@@ -48,6 +49,7 @@ type relayFileConfig struct {
 	ACMEEmail        string        `yaml:"acme_email"`
 	ACMECache        string        `yaml:"acme_cache"`
 	ACMEHTTP         string        `yaml:"acme_http"`
+	UpdatesDir       string        `yaml:"updates_dir"`
 	StreamIDMode     string        `yaml:"stream_id_mode"`
 }
 
@@ -118,6 +120,9 @@ func (o *relayOptions) applyFileConfig(cfg relayFileConfig) {
 	if cfg.ACMEHTTP != "" {
 		o.acmeHTTPAddr = cfg.ACMEHTTP
 	}
+	if cfg.UpdatesDir != "" {
+		o.updatesDir = cfg.UpdatesDir
+	}
 	if cfg.StreamIDMode != "" {
 		o.streamIDMode = cfg.StreamIDMode
 	}
@@ -142,6 +147,7 @@ func (o *relayOptions) applyEnvOverrides() {
 	o.acmeEmail = config.GetStringEnv("INTRATUN_RELAY_ACME_EMAIL", o.acmeEmail)
 	o.acmeCache = config.GetStringEnv("INTRATUN_RELAY_ACME_CACHE", o.acmeCache)
 	o.acmeHTTPAddr = config.GetStringEnv("INTRATUN_RELAY_ACME_HTTP", o.acmeHTTPAddr)
+	o.updatesDir = config.GetStringEnv("INTRATUN_RELAY_UPDATES_DIR", o.updatesDir)
 	o.streamIDMode = config.GetStringEnv("INTRATUN_RELAY_STREAM_ID_MODE", o.streamIDMode)
 }
 
@@ -150,8 +156,8 @@ func NewCommand(globals *runtime.Options) *cobra.Command {
 		proxyListen:      ":8080",
 		secureListen:     ":8443",
 		socksListen:      "",
-		maxFrame:         32 * 1024,
-		maxInFlight:      256 * 1024,
+		maxFrame:         128 * 1024,
+		maxInFlight:      4 * 1024 * 1024,
 		streamQueueDepth: 1024,
 		wsIdle:           45 * time.Second,
 		dialTimeoutMs:    10000,
@@ -202,6 +208,7 @@ func NewCommand(globals *runtime.Options) *cobra.Command {
 	cmd.Flags().StringVar(&opts.acmeEmail, "acme-email", "", "contact email for Let's Encrypt registration")
 	cmd.Flags().StringVar(&opts.acmeCache, "acme-cache", "", "directory for ACME certificate cache")
 	cmd.Flags().StringVar(&opts.acmeHTTPAddr, "acme-http", opts.acmeHTTPAddr, "optional listen address for ACME HTTP-01 challenges (e.g. :80)")
+	cmd.Flags().StringVar(&opts.updatesDir, "updates-dir", "", "optional directory served under /updates/ for automatic agent updates")
 	cmd.Flags().StringVar(&opts.streamIDMode, "stream-id-mode", opts.streamIDMode, "stream identifier generator (uuid or cuid)")
 
 	return cmd

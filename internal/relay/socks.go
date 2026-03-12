@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/drksbr/ProxyWebSock/internal/protocol"
+	"github.com/drksbr/ProxyWebSock/internal/util"
 )
 
 func (s *relayServer) serveSocks() error {
@@ -42,6 +43,7 @@ func (s *relayServer) handleSocksConn(conn net.Conn) {
 			_ = conn.Close()
 		}
 	}()
+	util.TuneTCPConn(conn, s.opts.maxFrame, s.opts.maxFrame)
 
 	remote := conn.RemoteAddr().String()
 	logger := s.logger.With("remote", remote, "protocol", "socks5")
@@ -121,7 +123,9 @@ func (s *relayServer) handleSocksConn(conn net.Conn) {
 	}
 
 	streamID := s.nextStreamID()
-	stream := newRelayStream(streamID, session, streamProtoSOCKS5, conn, nil, host, port, s.opts.streamQueueDepth)
+	stream := newRelayStream(streamID, session, streamProtoSOCKS5, conn, nil, host, port, s.opts.streamQueueDepth, func(delta int) error {
+		return session.sendWindowUpdate(streamID, delta)
+	})
 	if err := session.registerStream(stream); err != nil {
 		logger.Warn("register stream failed", "stream", streamID, "error", err)
 		_ = writeSocksReply(conn, 0x01)

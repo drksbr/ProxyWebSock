@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -51,8 +52,10 @@ type relayServer struct {
 	stats       relayCounters
 	resources   *resourceTracker
 
-	staticFS fs.FS
-	idGen    func() string
+	staticFS       fs.FS
+	updatesDir     string
+	executablePath string
+	idGen          func() string
 }
 
 type agentRecord struct {
@@ -102,6 +105,19 @@ func newRelayServer(logger *slog.Logger, opts *relayOptions) (*relayServer, erro
 		if err := os.MkdirAll(opts.acmeCache, 0o750); err != nil {
 			return nil, fmt.Errorf("create acme cache: %w", err)
 		}
+	}
+	executablePath, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("resolve executable path: %w", err)
+	}
+	updatesDir := opts.updatesDir
+	if updatesDir == "" {
+		updatesDir = filepath.Dir(executablePath)
+	}
+	if info, err := os.Stat(updatesDir); err != nil {
+		return nil, fmt.Errorf("updates dir: %w", err)
+	} else if !info.IsDir() {
+		return nil, fmt.Errorf("updates dir %q is not a directory", updatesDir)
 	}
 
 	acmeManager := &autocert.Manager{
@@ -156,10 +172,14 @@ func newRelayServer(logger *slog.Logger, opts *relayOptions) (*relayServer, erro
 		acmeManager:    acmeManager,
 		statusTmpl:     tmpl,
 		staticFS:       distFS,
+		updatesDir:     updatesDir,
+		executablePath: executablePath,
 		idGen:          idGen,
 		upgrader: websocket.Upgrader{
 			HandshakeTimeout:  10 * time.Second,
 			EnableCompression: false,
+			ReadBufferSize:    opts.maxFrame,
+			WriteBufferSize:   opts.maxFrame,
 			CheckOrigin: func(r *http.Request) bool {
 				return true
 			},
@@ -226,6 +246,7 @@ func (s *relayServer) run(ctx context.Context) error {
 	secureMux.Handle("/tunnel", http.HandlerFunc(s.handleTunnel))
 	secureMux.Handle("/autoconfig/", http.HandlerFunc(s.handleAutoConfig))
 	secureMux.Handle("/status.json", http.HandlerFunc(s.handleStatusJSON))
+	secureMux.Handle("/updates/", http.HandlerFunc(s.handleUpdates))
 	if s.staticFS != nil {
 		fileServer := http.FileServer(http.FS(s.staticFS))
 		secureMux.Handle("/assets/", fileServer)

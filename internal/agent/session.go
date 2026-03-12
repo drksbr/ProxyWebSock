@@ -18,14 +18,16 @@ import (
 
 	"github.com/drksbr/ProxyWebSock/internal/logger"
 	"github.com/drksbr/ProxyWebSock/internal/protocol"
+	"github.com/drksbr/ProxyWebSock/internal/util"
 )
 
 var errWriterClosed = errors.New("writer closed")
 
 type outboundMessage struct {
-	frame   *protocol.Frame
-	binary  []byte
-	onWrite func(success bool)
+	frame          *protocol.Frame
+	binaryStreamID string
+	binaryPayload  []byte
+	onWrite        func(success bool)
 }
 
 const resourceSampleInterval = 10 * time.Second
@@ -189,11 +191,19 @@ func (s *session) writeMessage(msg *outboundMessage) error {
 		}
 		return nil
 	}
-	if len(msg.binary) > 0 {
+	if len(msg.binaryPayload) > 0 {
 		if err := s.conn.SetWriteDeadline(time.Now().Add(20 * time.Second)); err != nil {
 			return err
 		}
-		writeErr := s.conn.WriteMessage(websocket.BinaryMessage, msg.binary)
+		writer, err := s.conn.NextWriter(websocket.BinaryMessage)
+		if err != nil {
+			return err
+		}
+		writeErr := protocol.WriteBinaryFrame(writer, msg.binaryStreamID, msg.binaryPayload)
+		closeErr := writer.Close()
+		if writeErr == nil {
+			writeErr = closeErr
+		}
 		if writeErr != nil {
 			return writeErr
 		}
@@ -230,7 +240,11 @@ func (s *session) run(ctx context.Context) error {
 	ctx = logger.ContextWithTrace(ctx, s.traceID)
 	defer s.conn.Close()
 
-	s.conn.SetReadLimit(1 << 20)
+	readLimit := int64(s.agent.opts.maxFrame + 1024)
+	if readLimit < 1<<20 {
+		readLimit = 1 << 20
+	}
+	s.conn.SetReadLimit(readLimit)
 	if err := s.register(); err != nil {
 		return err
 	}
@@ -297,16 +311,11 @@ func (s *session) readLoop() error {
 
 		switch messageType {
 		case websocket.BinaryMessage:
-			data, err := io.ReadAll(r)
+			streamID, payload, release, err := protocol.ReadBinaryFramePooled(r, s.agent.opts.maxFrame+1024)
 			if err != nil {
 				return err
 			}
-			streamID, payload, err := protocol.DecodeBinaryFrame(data)
-			if err != nil {
-				s.logger.Warn("binary decode failed", "error", err)
-				continue
-			}
-			s.handleBinaryWrite(streamID, payload)
+			s.handleBinaryWrite(streamID, payload, release)
 		case websocket.TextMessage:
 			var f protocol.Frame
 			if err := json.NewDecoder(r).Decode(&f); err != nil {
@@ -318,6 +327,8 @@ func (s *session) readLoop() error {
 				go s.handleDial(f)
 			case protocol.FrameTypeWrite:
 				s.handleWrite(f)
+			case protocol.FrameTypeWindow:
+				s.handleWindow(f)
 			case protocol.FrameTypeClose:
 				s.handleClose(f)
 			case protocol.FrameTypeError:
@@ -356,8 +367,11 @@ func (s *session) handleDial(f protocol.Frame) {
 		})
 		return
 	}
+	util.TuneTCPConn(conn, s.agent.opts.readBuffer, s.agent.opts.writeBuffer)
 
-	stream := newAgentStream(f.StreamID, conn, s.agent.opts.maxInFlight, s.agent.opts.queueDepth, s.logger)
+	stream := newAgentStream(f.StreamID, conn, s.agent.opts.maxInFlight, s.agent.opts.queueDepth, s.logger, func(delta int) error {
+		return s.sendWindowUpdate(f.StreamID, delta)
+	})
 	if err := s.storeStream(stream); err != nil {
 		s.logger.Warn("stream register failed", "stream", f.StreamID, "error", err)
 		conn.Close()
@@ -393,7 +407,7 @@ func (s *session) handleWrite(f protocol.Frame) {
 		s.logger.Warn("payload decode failed", "stream", f.StreamID, "error", err)
 		return
 	}
-	s.handleBinaryWrite(f.StreamID, payload)
+	s.handleBinaryWriteWithStream(stream, payload, nil)
 }
 
 func (s *session) handleClose(f protocol.Frame) {
@@ -416,6 +430,18 @@ func (s *session) handleRelayError(f protocol.Frame) {
 		s.logger.Warn("relay reported error", "stream", f.StreamID, "error", f.Error)
 		s.heartbeat.recordError(f.Error)
 	}
+}
+
+func (s *session) handleWindow(f protocol.Frame) {
+	if f.Window <= 0 {
+		return
+	}
+	stream := s.getStream(f.StreamID)
+	if stream == nil {
+		s.logger.Debug("window update for unknown stream", "stream", f.StreamID)
+		return
+	}
+	stream.release(f.Window)
 }
 
 func (s *session) handleHeartbeat(f protocol.Frame) {
@@ -536,23 +562,33 @@ func (s *session) sendHeartbeat() {
 	}
 }
 
-func (s *session) handleBinaryWrite(streamID string, payload []byte) {
+func (s *session) handleBinaryWrite(streamID string, payload []byte, release func()) {
 	stream := s.getStream(streamID)
 	if stream == nil {
+		if release != nil {
+			release()
+		}
 		s.logger.Warn("write for unknown stream", "stream", streamID)
 		return
 	}
+	s.handleBinaryWriteWithStream(stream, payload, release)
+}
+
+func (s *session) handleBinaryWriteWithStream(stream *agentStream, payload []byte, release func()) {
 	if len(payload) == 0 {
+		if release != nil {
+			release()
+		}
 		return
 	}
 
-	if err := stream.enqueueInbound(payload); err != nil && !errors.Is(err, errStreamClosed) {
-		s.logger.Warn("stream enqueue failed", "stream", streamID, "error", err)
+	if err := stream.enqueueInboundBuffer(payload, len(payload), release); err != nil && !errors.Is(err, errStreamClosed) {
+		s.logger.Warn("stream enqueue failed", "stream", stream.id, "error", err)
 		s.heartbeat.recordError(err.Error())
 		stream.close()
 		_ = s.sendFrame(&protocol.Frame{
 			Type:     protocol.FrameTypeError,
-			StreamID: streamID,
+			StreamID: stream.id,
 			Error:    err.Error(),
 		})
 	}
@@ -565,24 +601,31 @@ func (s *session) sendFrame(f *protocol.Frame) error {
 	return s.enqueueControl(outboundMessage{frame: f})
 }
 
-func (s *session) sendBinary(streamID string, payload []byte, onWrite func(success bool)) error {
-	data, release, err := protocol.EncodeBinaryFramePooled(streamID, payload)
-	if err != nil {
-		return err
+func (s *session) sendWindowUpdate(streamID string, delta int) error {
+	if delta <= 0 {
+		return nil
 	}
-	msg := outboundMessage{binary: data}
-	if onWrite != nil {
-		msg.onWrite = func(success bool) {
-			release()
-			onWrite(success)
-		}
-	} else {
-		msg.onWrite = func(bool) {
-			release()
-		}
+	return s.sendFrame(&protocol.Frame{
+		Type:     protocol.FrameTypeWindow,
+		StreamID: streamID,
+		Window:   delta,
+	})
+}
+
+func (s *session) sendBinary(streamID string, payload []byte, release func()) error {
+	msg := outboundMessage{
+		binaryStreamID: streamID,
+		binaryPayload:  payload,
+		onWrite: func(bool) {
+			if release != nil {
+				release()
+			}
+		},
 	}
 	if err := s.enqueueData(msg); err != nil {
-		release()
+		if release != nil {
+			release()
+		}
 		return err
 	}
 	return nil
@@ -625,28 +668,32 @@ func (s *session) pipeOutbound(stream *agentStream) {
 	}()
 
 	bufferSize := s.agent.opts.maxFrame
-	if bufferSize > s.agent.opts.readBuffer {
-		bufferSize = s.agent.opts.readBuffer
-	}
 	if bufferSize <= 0 {
 		bufferSize = 32 * 1024
 	}
 
-	buf := make([]byte, bufferSize)
+	buf := borrowAgentBuffer(bufferSize)
+	defer func() {
+		if buf != nil {
+			releaseAgentBuffer(buf)
+		}
+	}()
 	for {
-		n, err := stream.conn.Read(buf)
+		n, err := stream.conn.Read(buf[:bufferSize])
 		if n > 0 {
-			chunk := buf[:n]
-			stream.acquire(n)
-			chunkSize := n
-			errSend := s.sendBinary(stream.id, chunk, func(bool) {
-				stream.release(chunkSize)
-			})
-			if errSend != nil {
-				stream.release(chunkSize)
+			if !stream.acquire(n) {
+				return
+			}
+			sendBuf := buf[:n]
+			buf = nil
+			if errSend := s.sendBinary(stream.id, sendBuf, func() {
+				releaseAgentBuffer(sendBuf)
+			}); errSend != nil {
+				stream.release(n)
 				s.logger.Warn("send payload failed", "stream", stream.id, "error", errSend)
 				return
 			}
+			buf = borrowAgentBuffer(bufferSize)
 		}
 
 		if err != nil {

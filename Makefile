@@ -5,6 +5,7 @@ CMD := ./cmd/intratun
 BIN_DIR := bin
 BINARY := $(BIN_DIR)/intratun
 ARTIFACT_DIR := build/artifacts
+RELEASE_DIR := build/releases
 COVER_FILE := $(ARTIFACT_DIR)/coverage.out
 PROFILE_CPU := $(ARTIFACT_DIR)/cpu.pprof
 PROFILE_MEM := $(ARTIFACT_DIR)/mem.pprof
@@ -44,7 +45,7 @@ else
   $(error Unsupported package manager "$(PM)". Set PM=bun|npm|pnpm|yarn)
 endif
 
-.PHONY: all build fmt vet lint test race bench bench-profile fuzz cover tidy generate tools clean release \
+.PHONY: all build fmt vet lint test race bench bench-profile fuzz cover tidy generate tools clean release release-bin \
 	 run-relay run-relay-debug run-agent run-agent-debug relay-start relay-stop relay-restart \
 	 web-install web-build web-dev mkln version-sync update docker-build docker-run docker-push compose-up compose-down profiles
 
@@ -123,11 +124,16 @@ build: $(BIN_DIR) web-build
 	@$(GO) build -o $(BINARY) $(CMD)
 
 release: clean web-build
-	@echo "Building release binaries..."
-	@GOOS=linux GOARCH=amd64 $(GO) build -o $(BIN_DIR)/intratun-linux-amd64 $(CMD)
-	@GOOS=linux GOARCH=arm64 $(GO) build -o $(BIN_DIR)/intratun-linux-arm64 $(CMD)
-	@GOOS=darwin GOARCH=arm64 $(GO) build -o $(BIN_DIR)/intratun-darwin-arm64 $(CMD)
-	@GOOS=windows GOARCH=amd64 $(GO) build -o $(BIN_DIR)/intratun-windows-amd64.exe $(CMD)
+	@echo "Building versioned release artifacts..."
+	@bash scripts/build-release-artifacts.sh $(RELEASE_DIR)
+
+release-bin: clean web-build $(BIN_DIR)
+	@echo "Building colocated update binaries into $(BIN_DIR)..."
+	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -ldflags="-s -w" -o $(BIN_DIR)/intratun-linux-amd64 $(CMD)
+	@CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -trimpath -ldflags="-s -w" -o $(BIN_DIR)/intratun-linux-arm64 $(CMD)
+	@CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -ldflags="-s -w" -o $(BIN_DIR)/intratun-darwin-arm64 $(CMD)
+	@CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -trimpath -ldflags="-s -w" -o $(BIN_DIR)/intratun-windows-amd64.exe $(CMD)
+	@cd $(BIN_DIR) && shasum -a 256 intratun-* > SHA256SUMS
 
 profiles: bench-profile
 

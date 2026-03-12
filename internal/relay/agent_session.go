@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"regexp"
@@ -24,10 +23,11 @@ const (
 )
 
 type outboundMessage struct {
-	frame   *protocol.Frame
-	binary  []byte
-	control *controlMessage
-	onWrite func(success bool)
+	frame          *protocol.Frame
+	binaryStreamID string
+	binaryPayload  []byte
+	control        *controlMessage
+	onWrite        func(success bool)
 }
 
 type controlMessage struct {
@@ -225,11 +225,19 @@ func (s *relayAgentSession) writeMessage(msg *outboundMessage) error {
 		}
 		return nil
 	}
-	if len(msg.binary) > 0 {
+	if len(msg.binaryPayload) > 0 {
 		if err := s.conn.SetWriteDeadline(time.Now().Add(20 * time.Second)); err != nil {
 			return err
 		}
-		writeErr := s.conn.WriteMessage(websocket.BinaryMessage, msg.binary)
+		writer, err := s.conn.NextWriter(websocket.BinaryMessage)
+		if err != nil {
+			return err
+		}
+		writeErr := protocol.WriteBinaryFrame(writer, msg.binaryStreamID, msg.binaryPayload)
+		closeErr := writer.Close()
+		if writeErr == nil {
+			writeErr = closeErr
+		}
 		if writeErr != nil {
 			return writeErr
 		}
@@ -305,6 +313,11 @@ func (s *relayAgentSession) run() {
 }
 
 func (s *relayAgentSession) performRegister() error {
+	readLimit := int64(s.server.opts.maxFrame + 1024)
+	if readLimit < 1<<20 {
+		readLimit = 1 << 20
+	}
+	s.conn.SetReadLimit(readLimit)
 	if err := s.conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		return err
 	}
@@ -371,17 +384,12 @@ func (s *relayAgentSession) readLoop() {
 
 		switch messageType {
 		case websocket.BinaryMessage:
-			data, err := io.ReadAll(r)
+			streamID, payload, release, err := protocol.ReadBinaryFramePooled(r, s.server.opts.maxFrame+1024)
 			if err != nil {
 				s.logger.Warn("binary read failed", "error", err)
 				return
 			}
-			streamID, payload, err := protocol.DecodeBinaryFrame(data)
-			if err != nil {
-				s.logger.Warn("binary decode failed", "error", err)
-				continue
-			}
-			s.handleBinaryWrite(streamID, payload)
+			s.handleBinaryWrite(streamID, payload, release)
 		case websocket.TextMessage:
 			var f protocol.Frame
 			if err := json.NewDecoder(r).Decode(&f); err != nil {
@@ -393,6 +401,8 @@ func (s *relayAgentSession) readLoop() {
 				s.handleDialAck(f)
 			case protocol.FrameTypeWrite:
 				s.handleWrite(f)
+			case protocol.FrameTypeWindow:
+				s.handleWindow(f)
 			case protocol.FrameTypeClose:
 				s.handleClose(f)
 			case protocol.FrameTypeError:
@@ -432,31 +442,53 @@ func (s *relayAgentSession) handleWrite(f protocol.Frame) {
 		s.logger.Warn("payload decode failed", "stream", f.StreamID, "error", err)
 		return
 	}
-	s.handleBinaryWrite(f.StreamID, payload)
+	s.handleBinaryWriteWithStream(stream, payload, nil)
 }
 
-func (s *relayAgentSession) handleBinaryWrite(streamID string, payload []byte) {
+func (s *relayAgentSession) handleBinaryWrite(streamID string, payload []byte, release func()) {
 	stream := s.lookupStream(streamID)
 	if stream == nil {
+		if release != nil {
+			release()
+		}
 		s.logger.Debug("write for unknown stream", "stream", streamID)
 		return
 	}
+	s.handleBinaryWriteWithStream(stream, payload, release)
+}
+
+func (s *relayAgentSession) handleBinaryWriteWithStream(stream *relayStream, payload []byte, release func()) {
 	stream.markReady(nil)
 	if len(payload) == 0 {
+		if release != nil {
+			release()
+		}
 		return
 	}
-	if err := stream.writeToClient(payload); err != nil {
+	if err := stream.writeToClientBuffer(payload, len(payload), release); err != nil {
 		if errors.Is(err, errClientStreamClosed) {
 			return
 		}
 		if errors.Is(err, errClientBacklog) {
-			s.logger.Debug("client backlog exceeded", "stream", streamID)
+			s.logger.Debug("client backlog exceeded", "stream", stream.id)
 		} else {
-			s.logger.Debug("enqueue to client failed", "stream", streamID, "error", err)
+			s.logger.Debug("enqueue to client failed", "stream", stream.id, "error", err)
 		}
 		stream.closeFromRelay(err)
 		return
 	}
+}
+
+func (s *relayAgentSession) handleWindow(f protocol.Frame) {
+	if f.Window <= 0 {
+		return
+	}
+	stream := s.lookupStream(f.StreamID)
+	if stream == nil {
+		s.logger.Debug("window update for unknown stream", "stream", f.StreamID)
+		return
+	}
+	stream.release(f.Window)
 }
 
 func (s *relayAgentSession) handleClose(f protocol.Frame) {
@@ -548,14 +580,31 @@ func (s *relayAgentSession) send(f *protocol.Frame) error {
 	return s.enqueueControl(outboundMessage{frame: f})
 }
 
-func (s *relayAgentSession) sendBinary(streamID string, payload []byte) error {
-	data, release, err := protocol.EncodeBinaryFramePooled(streamID, payload)
-	if err != nil {
-		return err
+func (s *relayAgentSession) sendWindowUpdate(streamID string, delta int) error {
+	if delta <= 0 {
+		return nil
 	}
-	msg := outboundMessage{binary: data, onWrite: func(bool) { release() }}
+	return s.send(&protocol.Frame{
+		Type:     protocol.FrameTypeWindow,
+		StreamID: streamID,
+		Window:   delta,
+	})
+}
+
+func (s *relayAgentSession) sendBinary(streamID string, payload []byte, release func()) error {
+	msg := outboundMessage{
+		binaryStreamID: streamID,
+		binaryPayload:  payload,
+		onWrite: func(bool) {
+			if release != nil {
+				release()
+			}
+		},
+	}
 	if err := s.enqueueData(msg); err != nil {
-		release()
+		if release != nil {
+			release()
+		}
 		return err
 	}
 	return nil

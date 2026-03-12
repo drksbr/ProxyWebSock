@@ -92,6 +92,8 @@ make race         # go test -race ./...
 make bench        # go test -bench=.
 make fuzz         # go test ./internal/protocol -fuzz=FuzzDecodeBinaryFrame
 make cover        # coverage report (build/coverage.out)
+make release      # versioned cross-platform artifacts in build/releases/<version>
+make release-bin  # colocated update binaries in ./bin for relay auto-update
 ```
 
 ### Run the Relay
@@ -164,6 +166,9 @@ Configuration obeys **env > file > flags**. Both commands accept `--config` (YAM
 | `INTRATUN_AGENT_MAX_INFLIGHT`         | Per-stream inflight bytes              |
 | `INTRATUN_AGENT_QUEUE_DEPTH`          | Per-stream queue depth                 |
 | `INTRATUN_AGENT_RECONNECT_MIN/MAX`    | Durations (e.g. `2s`, `30s`)           |
+| `INTRATUN_AGENT_UPDATE_MANIFEST`      | Remote JSON manifest for agent updates |
+| `INTRATUN_AGENT_UPDATE_INTERVAL`      | Check interval (e.g. `30m`)            |
+| `INTRATUN_AGENT_UPDATE_TIMEOUT`       | Download/check timeout                 |
 
 ### Relay
 
@@ -182,6 +187,7 @@ Configuration obeys **env > file > flags**. Both commands accept `--config` (YAM
 | `INTRATUN_RELAY_DIAL_TIMEOUT_MS`           | Dial acknowledgement timeout             |
 | `INTRATUN_RELAY_ACME_HOSTS` / `EMAIL`      | ACME config                              |
 | `INTRATUN_RELAY_ACME_CACHE` / `ACME_HTTP`  | ACME cache/HTTP-01 endpoint              |
+| `INTRATUN_RELAY_UPDATES_DIR`               | Directory served at `/updates/`          |
 | `INTRATUN_RELAY_STREAM_ID_MODE`            | `uuid` (default) or `cuid`               |
 
 Sample YAML snippets live in `config/`.
@@ -203,6 +209,7 @@ Sample YAML snippets live in `config/`.
 | `--max-frame`                                                   | Max payload chunk per frame                      |
 | `--ws-idle`                                                     | WebSocket idle timeout                           |
 | `--dial-timeout-ms`                                             | Agent dial acknowledgement timeout               |
+| `--updates-dir`                                                 | Optional directory for colocated agent binaries  |
 
 ### Agent Flags
 
@@ -214,6 +221,47 @@ Sample YAML snippets live in `config/`.
 | `--max-frame`                | Max chunk size to relay           |
 | `--read-buf` / `--write-buf` | Socket and WebSocket buffer sizes |
 | `--max-inflight`             | Per-stream backpressure limit     |
+| `--update-manifest`          | Update manifest URL, `auto`, or `off` |
+| `--update-interval`          | Periodic update check interval    |
+| `--update-timeout`           | Manifest/download timeout         |
+
+### Automatic Agent Updates
+
+Automatic agent updates are now enabled by default. If no manifest URL is configured, the agent derives a conventional manifest URL from the relay:
+
+```text
+https://<relay-host>/updates/manifest-<goos>-<goarch>.json
+```
+
+Set `--update-manifest=off` to disable it. On a newer version, the agent downloads the new binary, verifies the `sha256`, atomically replaces the current executable, and re-execs itself.
+
+Example manifest:
+
+```json
+{
+  "version": "0.1.1+build.70.abcd123",
+  "url": "https://relay.example.com/updates/bin/linux/amd64",
+  "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+}
+```
+
+Example agent:
+
+```bash
+./intratun agent \
+  --relay=wss://relay.example.com/tunnel \
+  --id=myagent \
+  --token=supersecret
+```
+
+Notes:
+
+- If you want to override the default path, use `--update-manifest=https://...`.
+- By default the relay generates the manifest itself and looks for agent binaries in the same directory as the relay executable.
+- `--updates-dir` overrides that directory when you want to keep release artifacts elsewhere.
+- `make release-bin` builds the artifact names that the relay auto-update endpoint already expects and writes `SHA256SUMS`.
+- The manifest is expected to be served over HTTP(S).
+- Windows self-update is not supported yet.
 
 ## Observability
 

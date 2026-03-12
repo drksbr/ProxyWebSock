@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/drksbr/ProxyWebSock/internal/protocol"
+	"github.com/drksbr/ProxyWebSock/internal/util"
 )
 
 func (s *relayServer) handleTunnel(w http.ResponseWriter, r *http.Request) {
@@ -15,6 +16,7 @@ func (s *relayServer) handleTunnel(w http.ResponseWriter, r *http.Request) {
 		s.logger.Warn("upgrade failed", "error", err, "remote", r.RemoteAddr)
 		return
 	}
+	util.TuneTCPConn(conn.UnderlyingConn(), s.opts.maxFrame, s.opts.maxFrame)
 
 	session := newRelayAgentSession(s, conn, r.RemoteAddr)
 	go session.run()
@@ -90,6 +92,7 @@ func (s *relayServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "hijack failed", http.StatusInternalServerError)
 		return
 	}
+	util.TuneTCPConn(clientConn, s.opts.maxFrame, s.opts.maxFrame)
 
 	defer func() {
 		if err != nil {
@@ -104,7 +107,9 @@ func (s *relayServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	streamID := s.nextStreamID()
-	stream := newRelayStream(streamID, session, streamProtoHTTP, clientConn, buf, host, port, s.opts.streamQueueDepth)
+	stream := newRelayStream(streamID, session, streamProtoHTTP, clientConn, buf, host, port, s.opts.streamQueueDepth, func(delta int) error {
+		return session.sendWindowUpdate(streamID, delta)
+	})
 	if err := session.registerStream(stream); err != nil {
 		writeProxyError(buf, fmt.Sprintf("stream register failed: %v", err))
 		return
