@@ -54,7 +54,7 @@ _The agent maintains a persistent WSS tunnel, multiplexing traffic via JSON fram
 
 ## Features
 
-- **Single binary** (Go 1.22) powered by Cobra with `relay` and `agent` subcommands.
+- **Single binary** (Go 1.23) powered by Cobra with `relay` and `agent` subcommands.
 - **Reverse tunnel over WebSockets**: only outbound HTTPS/WSS is required from the intranet.
 - **Dual proxies**:
   - HTTP CONNECT (Basic Auth).
@@ -73,7 +73,7 @@ _The agent maintains a persistent WSS tunnel, multiplexing traffic via JSON fram
 
 ### Prerequisites
 
-- Go 1.22+
+- Go 1.23+
 - Public domain pointing to the relay host (for ACME)
 - Outbound HTTPS/WSS allowed from the intranet host running the agent
 
@@ -103,7 +103,9 @@ make release-bin  # colocated update binaries in ./bin for relay auto-update
   --proxy-listen=:8080 \
   --secure-listen=:443 \
   --socks-listen=:1080 \
-  --agents=myagent:supersecret \
+  --agent-config=config/agents.example.yaml \
+  --dashboard-user=admin \
+  --dashboard-pass=change-me \
   --acl-allow='^.*:443$' \
   --acme-host=relay.example.com \
   --acme-email=ops@example.com \
@@ -179,6 +181,7 @@ Configuration obeys **env > file > flags**. Both commands accept `--config` (YAM
 | `INTRATUN_RELAY_SECURE_LISTEN`             | HTTPS listener                           |
 | `INTRATUN_RELAY_SOCKS_LISTEN`              | SOCKS5 listener                          |
 | `INTRATUN_RELAY_AGENT_CONFIG`              | Agents definition YAML                   |
+| `INTRATUN_RELAY_DASHBOARD_USER` / `PASS`   | Basic auth for dashboard and downloads   |
 | `INTRATUN_RELAY_ACL_ALLOW`                 | Comma/space separated regex list         |
 | `INTRATUN_RELAY_MAX_FRAME`                 | Max frame payload size                   |
 | `INTRATUN_RELAY_MAX_INFLIGHT`              | Client backlog limit bytes               |
@@ -203,10 +206,13 @@ Sample YAML snippets live in `config/`.
 | `--proxy-listen`                                                | HTTP CONNECT listener (`:8080` default)          |
 | `--secure-listen`                                               | HTTPS listener for `/tunnel`, dashboard, metrics |
 | `--socks-listen`                                                | Optional SOCKS5 listener                         |
-| `--agents`                                                      | Allowed credentials `agentId:token` (repeatable) |
+| `--agent-config`                                                | YAML file with allowed agents                    |
+| `--dashboard-user` / `--dashboard-pass`                         | Basic auth for dashboard, `status.json`, downloads |
 | `--acl-allow`                                                   | Regex ACL for `host:port` destinations           |
 | `--acme-host` / `--acme-email` / `--acme-cache` / `--acme-http` | Let’s Encrypt settings                           |
 | `--max-frame`                                                   | Max payload chunk per frame                      |
+| `--max-inflight`                                                | Per-stream queued bytes toward clients           |
+| `--stream-queue-depth`                                          | Per-stream client queue length                   |
 | `--ws-idle`                                                     | WebSocket idle timeout                           |
 | `--dial-timeout-ms`                                             | Agent dial acknowledgement timeout               |
 | `--updates-dir`                                                 | Optional directory for colocated agent binaries  |
@@ -263,6 +269,22 @@ Notes:
 - The manifest is expected to be served over HTTP(S).
 - Windows self-update is not supported yet.
 
+### Docker Compose
+
+The repository now ships with `docker-compose.yaml` tuned for relay throughput on Linux hosts:
+
+- `network_mode: host` to avoid Docker NAT on the proxy and SOCKS5 path.
+- `nofile` raised to `1048576`.
+- ACME cache persisted in a named volume.
+- Agent binaries mounted from `./bin` so dashboard downloads and auto-update share the same artifacts.
+- Dashboard auth required through `INTRATUN_DASHBOARD_USER` / `INTRATUN_DASHBOARD_PASS`.
+
+Start it with:
+
+```bash
+docker compose up -d --build
+```
+
 ## Observability
 
 - Structured logs now include `service`, `component`, `trace_id`, and `span_id`. Use `INTRATUN_LOG_LEVEL` / `INTRATUN_JSON_LOGS` for formatting.
@@ -275,7 +297,9 @@ Notes:
   - Live summary counters.
   - CPU/RSS graphs covering the last seven days (sampled every minute).
   - Connected agents, active streams, PAC download links.
+  - Download buttons for agent ZIP artifacts served directly by the relay.
 - `https://relay.example.com/status.json` provides the raw data; think of it as the REST-ish back-end for the dashboard.
+- The dashboard, `status.json`, static assets, and agent ZIP downloads can be protected with HTTP Basic auth via `--dashboard-user` / `--dashboard-pass`.
 - `https://relay.example.com/metrics` exposes Prometheus metrics (`intratun_bytes_*`, `intratun_agents_connected`, etc.).
 
 For browser setup:
@@ -287,7 +311,7 @@ For browser setup:
 
 ## Advanced Topics
 
-- **Access Control:** Use multiple `--agents` entries and tighten ACLs for each relay instance. Future work may scope ACLs per agent.
+- **Access Control:** Define agents in YAML via `--agent-config` and tighten ACLs for each relay instance. Future work may scope ACLs per agent.
 - **Scaling Agents:** The WebSocket protocol multiplexes streams with `streamId`, so a single agent connection can handle many simultaneous tunnels.
 - **High Availability:** Run multiple relays behind a load balancer; agents reconnect on failure, and browsers will retry the proxy automatically.
 - **Extensibility:** The JSON frame protocol was designed with room for new message types (e.g., SOCKS5 UDP associate, mTLS, credit systems, audit trails).

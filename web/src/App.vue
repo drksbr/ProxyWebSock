@@ -63,6 +63,7 @@ const emptyStatus: StatusPayload = {
   secureAddr: "",
   socksAddr: "",
   acmeHosts: [],
+  downloads: [],
   agents: [],
   metrics: {
     agentsConnected: 0,
@@ -228,6 +229,7 @@ function normalizePayload(payload?: StatusPayload): StatusPayload {
     secureAddr: payload.secureAddr ?? "",
     socksAddr: payload.socksAddr ?? "",
     acmeHosts: payload.acmeHosts ?? [],
+    downloads: payload.downloads ?? [],
     agents: normalizedAgents,
     metrics: {
       agentsConnected: payload.metrics?.agentsConnected ?? 0,
@@ -253,7 +255,7 @@ function normalizePayload(payload?: StatusPayload): StatusPayload {
 function schedulePoll() {
   pollTimer = window.setTimeout(async () => {
     try {
-      const res = await fetch("https://relay.neurocirurgiahgrs.com.br/status.json", {
+      const res = await fetch("/status.json", {
         cache: "no-store",
       });
       if (!res.ok) {
@@ -341,11 +343,12 @@ function handleRangeUpdate(minutes: number) {
       <AppHeader
         :proxy-addr="data.proxyAddr"
         :secure-addr="data.secureAddr"
-        :socks-addr="data.socksAddr"
-        :acme-hosts="data.acmeHosts"
-        :backend-version="data.backendVersion ?? ''"
-        :frontend-version="frontendVersion"
-      />
+      :socks-addr="data.socksAddr"
+      :acme-hosts="data.acmeHosts"
+      :downloads="data.downloads ?? []"
+      :backend-version="data.backendVersion ?? ''"
+      :frontend-version="frontendVersion"
+    />
 
       <SummarySection :generated-at="data.generatedAt" :refresh-options="REFRESH_OPTIONS"
         :selected-interval="refreshIntervalMs" :summary-cards="summaryCards"

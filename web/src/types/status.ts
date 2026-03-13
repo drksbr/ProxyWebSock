@@ -60,12 +60,22 @@ export type StatusMetrics = {
   authFailures: number;
 };
 
+export type StatusDownload = {
+  label: string;
+  goos: string;
+  goarch: string;
+  url: string;
+  fileName: string;
+  version?: string;
+};
+
 export type StatusPayload = {
   generatedAt: string;
   proxyAddr: string;
   secureAddr: string;
   socksAddr: string;
   acmeHosts: string[];
+  downloads?: StatusDownload[];
   agents: StatusAgent[];
   metrics: StatusMetrics;
   resources: ResourceSnapshot;

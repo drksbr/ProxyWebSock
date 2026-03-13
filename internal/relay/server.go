@@ -78,6 +78,9 @@ func newRelayServer(logger *slog.Logger, opts *relayOptions) (*relayServer, erro
 	if len(agentDirectory) == 0 {
 		return nil, errors.New("agent configuration file must define at least one agent")
 	}
+	if (opts.dashboardUser == "") != (opts.dashboardPass == "") {
+		return nil, errors.New("--dashboard-user and --dashboard-pass must be set together")
+	}
 
 	acl, err := compileACLs(opts.aclPatterns)
 	if err != nil {
@@ -245,15 +248,17 @@ func (s *relayServer) run(ctx context.Context) error {
 	secureMux.Handle("/metrics", promhttp.Handler())
 	secureMux.Handle("/tunnel", http.HandlerFunc(s.handleTunnel))
 	secureMux.Handle("/autoconfig/", http.HandlerFunc(s.handleAutoConfig))
-	secureMux.Handle("/status.json", http.HandlerFunc(s.handleStatusJSON))
+	secureMux.Handle("/status.json", s.dashboardAuth(http.HandlerFunc(s.handleStatusJSON)))
+	secureMux.Handle("/downloads/", s.dashboardAuth(http.HandlerFunc(s.handleDashboardDownloads)))
 	secureMux.Handle("/updates/", http.HandlerFunc(s.handleUpdates))
 	if s.staticFS != nil {
 		fileServer := http.FileServer(http.FS(s.staticFS))
-		secureMux.Handle("/assets/", fileServer)
-		secureMux.Handle("/logo.svg", fileServer)
-		secureMux.Handle("/logo-white.svg", fileServer)
+		protectedFiles := s.dashboardAuth(fileServer)
+		secureMux.Handle("/assets/", protectedFiles)
+		secureMux.Handle("/logo.svg", protectedFiles)
+		secureMux.Handle("/logo-white.svg", protectedFiles)
 	}
-	secureMux.Handle("/", http.HandlerFunc(s.handleStatus))
+	secureMux.Handle("/", s.dashboardAuth(http.HandlerFunc(s.handleStatus)))
 
 	s.secureSrv = &http.Server{
 		Addr:              s.opts.secureListen,
@@ -368,13 +373,32 @@ func (s *relayServer) authenticateAgent(agentID, token string) (*agentRecord, bo
 	if !ok {
 		return nil, false
 	}
-	if len(record.Password) != len(token) {
-		return nil, false
-	}
-	if subtle.ConstantTimeCompare([]byte(record.Password), []byte(token)) != 1 {
+	if !secureStringEquals(record.Password, token) {
 		return nil, false
 	}
 	return record, true
+}
+
+func (s *relayServer) dashboardAuth(next http.Handler) http.Handler {
+	if s.opts == nil || (s.opts.dashboardUser == "" && s.opts.dashboardPass == "") {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok := r.BasicAuth()
+		if !ok || !secureStringEquals(s.opts.dashboardUser, user) || !secureStringEquals(s.opts.dashboardPass, pass) {
+			w.Header().Set("WWW-Authenticate", `Basic realm="intratun-dashboard", charset="UTF-8"`)
+			http.Error(w, "dashboard auth required", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func secureStringEquals(expected, actual string) bool {
+	if len(expected) != len(actual) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(actual)) == 1
 }
 
 func (s *relayServer) authorizeTarget(agentID, hostport string) error {

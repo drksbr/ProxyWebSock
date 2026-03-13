@@ -1,0 +1,52 @@
+# Para throughput máximo em Linux, o relay roda em host networking.
+# Ajuste as variáveis no ambiente ou em um arquivo .env antes de subir.
+services:
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: intratun-relay:local
+    container_name: intratun-relay
+    restart: unless-stopped
+    init: true
+    network_mode: host
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    stop_grace_period: 15s
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    environment:
+      INTRATUN_JSON_LOGS: "true"
+      INTRATUN_LOG_LEVEL: "info"
+    volumes:
+      - ./config/agents.example.yaml:/etc/intratun/agents.yaml:ro
+      - ./bin:/var/lib/intratun/updates:ro
+      - relay-acme:/var/lib/intratun/acme
+    command:
+      - relay
+      - --proxy-listen=:8080
+      - --secure-listen=:443
+      - --socks-listen=:1080
+      - --agent-config=/etc/intratun/agents.yaml
+      - --acme-host=${INTRATUN_ACME_HOST:?defina INTRATUN_ACME_HOST}
+      - --acme-email=${INTRATUN_ACME_EMAIL:?defina INTRATUN_ACME_EMAIL}
+      - --acme-cache=/var/lib/intratun/acme
+      - --acme-http=:80
+      - --updates-dir=/var/lib/intratun/updates
+      - --dashboard-user=${INTRATUN_DASHBOARD_USER:?defina INTRATUN_DASHBOARD_USER}
+      - --dashboard-pass=${INTRATUN_DASHBOARD_PASS:?defina INTRATUN_DASHBOARD_PASS}
+      - --max-frame=131072
+      - --max-inflight=4194304
+      - --stream-queue-depth=2048
+      - --dial-timeout-ms=10000
+      - --ws-idle=45s
+
+volumes:
+  relay-acme:

@@ -1,11 +1,14 @@
 <script setup lang="ts">
 import { computed } from "vue";
 
+import type { StatusDownload } from "../types/status";
+
 const props = defineProps<{
   proxyAddr: string;
   secureAddr: string;
   socksAddr: string;
   acmeHosts: string[];
+  downloads: StatusDownload[];
   backendVersion: string;
   frontendVersion: string;
 }>();
@@ -53,6 +56,29 @@ const versionMismatch = computed(() => {
       <div class="mb-2 text-sm text-slate-400">ACME Hosts</div>
       <div class="font-mono text-sm">
         {{ acmeLabel }}
+      </div>
+    </div>
+    <div class="rounded-lg border border-slate-800 bg-slate-900/60 p-4 lg:col-span-3">
+      <div class="mb-3 text-sm text-slate-400">Downloads do agente</div>
+      <div v-if="downloads.length" class="flex flex-wrap gap-3">
+        <a
+          v-for="download in downloads"
+          :key="`${download.goos}-${download.goarch}`"
+          :href="download.url"
+          :download="download.fileName"
+          class="rounded-lg border border-slate-700 bg-slate-950/70 px-4 py-3 transition hover:border-cyan-400/60 hover:bg-slate-950"
+        >
+          <div class="text-sm font-semibold text-slate-100">{{ download.label }}</div>
+          <div class="mt-1 font-mono text-xs text-slate-400">
+            {{ download.fileName }}
+          </div>
+          <div v-if="download.version" class="mt-1 text-xs text-cyan-300">
+            {{ download.version }}
+          </div>
+        </a>
+      </div>
+      <div v-else class="text-sm text-slate-500">
+        Nenhum artefato de agente disponível no relay.
       </div>
     </div>
     <div

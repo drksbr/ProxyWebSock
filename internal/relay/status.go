@@ -19,6 +19,7 @@ type statusPayload struct {
 	SecureAddr     string           `json:"secureAddr"`
 	SocksAddr      string           `json:"socksAddr"`
 	ACMEHosts      []string         `json:"acmeHosts"`
+	Downloads      []statusDownload `json:"downloads,omitempty"`
 	Agents         []statusAgent    `json:"agents"`
 	Metrics        statusMetrics    `json:"metrics"`
 	Resources      resourceSnapshot `json:"resources"`
@@ -36,6 +37,15 @@ type statusMetrics struct {
 	BytesDown       int64 `json:"bytesDown"`
 	DialErrors      int64 `json:"dialErrors"`
 	AuthFailures    int64 `json:"authFailures"`
+}
+
+type statusDownload struct {
+	Label    string `json:"label"`
+	GOOS     string `json:"goos"`
+	GOARCH   string `json:"goarch"`
+	URL      string `json:"url"`
+	FileName string `json:"fileName"`
+	Version  string `json:"version,omitempty"`
 }
 
 type statusAgent struct {
@@ -148,6 +158,7 @@ func (s *relayServer) collectStatus(r *http.Request) statusPayload {
 		SecureAddr:  s.opts.secureListen,
 		SocksAddr:   s.opts.socksListen,
 		ACMEHosts:   append([]string(nil), s.opts.acmeHosts...),
+		Downloads:   s.availableDashboardDownloads(r),
 		Agents:      agents,
 		Metrics: statusMetrics{
 			AgentsConnected: connectedCount,

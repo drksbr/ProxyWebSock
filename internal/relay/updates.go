@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"archive/zip"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -26,6 +27,19 @@ type updateArtifact struct {
 	SHA256  string
 }
 
+type dashboardDownloadTarget struct {
+	GOOS   string
+	GOARCH string
+	Label  string
+}
+
+var dashboardDownloadTargets = []dashboardDownloadTarget{
+	{GOOS: "linux", GOARCH: "amd64", Label: "Linux x86_64"},
+	{GOOS: "linux", GOARCH: "arm64", Label: "Linux ARM64"},
+	{GOOS: "darwin", GOARCH: "arm64", Label: "macOS Apple Silicon"},
+	{GOOS: "windows", GOARCH: "amd64", Label: "Windows x86_64"},
+}
+
 func (s *relayServer) handleUpdates(w http.ResponseWriter, r *http.Request) {
 	cleanPath := path.Clean("/" + strings.TrimPrefix(r.URL.Path, "/updates/"))
 	switch {
@@ -35,6 +49,28 @@ func (s *relayServer) handleUpdates(w http.ResponseWriter, r *http.Request) {
 		s.handleUpdateBinary(w, r, cleanPath)
 	default:
 		http.NotFound(w, r)
+	}
+}
+
+func (s *relayServer) handleDashboardDownloads(w http.ResponseWriter, r *http.Request) {
+	cleanPath := path.Clean("/" + strings.TrimPrefix(r.URL.Path, "/downloads/"))
+	goos, goarch, ok := parseDashboardDownloadPath(cleanPath)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	artifact, err := s.findUpdateArtifact(goos, goarch)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			http.NotFound(w, r)
+			return
+		}
+		s.logger.Warn("dashboard download resolve failed", "goos", goos, "goarch", goarch, "error", err)
+		http.Error(w, "dashboard download error", http.StatusInternalServerError)
+		return
+	}
+	if err := serveZippedArtifact(w, artifact); err != nil {
+		s.logger.Warn("dashboard zip failed", "goos", goos, "goarch", goarch, "error", err)
 	}
 }
 
@@ -95,6 +131,19 @@ func (s *relayServer) handleUpdateBinary(w http.ResponseWriter, r *http.Request,
 }
 
 func (s *relayServer) resolveUpdateArtifact(goos, goarch string) (*updateArtifact, error) {
+	artifact, err := s.findUpdateArtifact(goos, goarch)
+	if err != nil {
+		return nil, err
+	}
+	sum, err := sha256File(artifact.Path)
+	if err != nil {
+		return nil, err
+	}
+	artifact.SHA256 = sum
+	return artifact, nil
+}
+
+func (s *relayServer) findUpdateArtifact(goos, goarch string) (*updateArtifact, error) {
 	candidates := s.updateCandidates(goos, goarch)
 	for _, candidate := range candidates {
 		info, err := os.Stat(candidate)
@@ -107,19 +156,33 @@ func (s *relayServer) resolveUpdateArtifact(goos, goarch string) (*updateArtifac
 		if info.IsDir() {
 			continue
 		}
-		sum, err := sha256File(candidate)
-		if err != nil {
-			return nil, err
-		}
 		return &updateArtifact{
 			GOOS:    goos,
 			GOARCH:  goarch,
 			Path:    candidate,
 			Version: version.Version,
-			SHA256:  sum,
 		}, nil
 	}
 	return nil, os.ErrNotExist
+}
+
+func (s *relayServer) availableDashboardDownloads(r *http.Request) []statusDownload {
+	downloads := make([]statusDownload, 0, len(dashboardDownloadTargets))
+	for _, target := range dashboardDownloadTargets {
+		artifact, err := s.findUpdateArtifact(target.GOOS, target.GOARCH)
+		if err != nil {
+			continue
+		}
+		downloads = append(downloads, statusDownload{
+			Label:    target.Label,
+			GOOS:     artifact.GOOS,
+			GOARCH:   artifact.GOARCH,
+			URL:      s.dashboardDownloadURL(r, artifact.GOOS, artifact.GOARCH),
+			FileName: dashboardArchiveName(artifact),
+			Version:  artifact.Version,
+		})
+	}
+	return downloads
 }
 
 func (s *relayServer) updateCandidates(goos, goarch string) []string {
@@ -157,7 +220,22 @@ func parseBinaryPath(cleanPath string) (string, string, bool) {
 	return parts[1], parts[2], true
 }
 
+func parseDashboardDownloadPath(cleanPath string) (string, string, bool) {
+	parts := strings.Split(strings.TrimPrefix(cleanPath, "/"), "/")
+	if len(parts) != 3 || parts[0] != "agent" || parts[1] == "" || parts[2] == "" {
+		return "", "", false
+	}
+	goarch := strings.TrimSuffix(parts[2], ".zip")
+	if goarch == "" || !strings.HasSuffix(parts[2], ".zip") {
+		return "", "", false
+	}
+	return parts[1], goarch, true
+}
+
 func (s *relayServer) externalUpdateURL(r *http.Request, pathValue string) string {
+	if r == nil {
+		return pathValue
+	}
 	scheme := "https"
 	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); forwarded != "" {
 		scheme = strings.Split(forwarded, ",")[0]
@@ -169,6 +247,52 @@ func (s *relayServer) externalUpdateURL(r *http.Request, pathValue string) strin
 		Host:   r.Host,
 		Path:   pathValue,
 	}).String()
+}
+
+func (s *relayServer) dashboardDownloadURL(r *http.Request, goos, goarch string) string {
+	return s.externalUpdateURL(r, fmt.Sprintf("/downloads/agent/%s/%s.zip", goos, goarch))
+}
+
+func dashboardArchiveName(artifact *updateArtifact) string {
+	suffix := ""
+	if artifact.GOOS == "windows" {
+		suffix = ".exe"
+	}
+	return fmt.Sprintf("intratun-%s-%s%s.zip", artifact.GOOS, artifact.GOARCH, suffix)
+}
+
+func serveZippedArtifact(w http.ResponseWriter, artifact *updateArtifact) error {
+	info, err := os.Stat(artifact.Path)
+	if err != nil {
+		return err
+	}
+	file, err := os.Open(artifact.Path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Intratun-Version", artifact.Version)
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, dashboardArchiveName(artifact)))
+
+	zipWriter := zip.NewWriter(w)
+	defer zipWriter.Close()
+
+	header, err := zip.FileInfoHeader(info)
+	if err != nil {
+		return err
+	}
+	header.Name = filepath.Base(artifact.Path)
+	header.Method = zip.Deflate
+
+	entry, err := zipWriter.CreateHeader(header)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(entry, file)
+	return err
 }
 
 func sha256File(filePath string) (string, error) {

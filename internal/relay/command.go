@@ -19,6 +19,8 @@ type relayOptions struct {
 	secureListen     string
 	socksListen      string
 	agentConfig      string
+	dashboardUser    string
+	dashboardPass    string
 	aclPatterns      []string
 	maxFrame         int
 	maxInFlight      int
@@ -39,6 +41,8 @@ type relayFileConfig struct {
 	SecureListen     string        `yaml:"secure_listen"`
 	SocksListen      string        `yaml:"socks_listen"`
 	AgentConfig      string        `yaml:"agent_config"`
+	DashboardUser    string        `yaml:"dashboard_user"`
+	DashboardPass    string        `yaml:"dashboard_pass"`
 	ACLPatterns      []string      `yaml:"acl_allow"`
 	MaxFrame         int           `yaml:"max_frame"`
 	MaxInFlight      int           `yaml:"max_inflight"`
@@ -90,6 +94,12 @@ func (o *relayOptions) applyFileConfig(cfg relayFileConfig) {
 	if cfg.AgentConfig != "" {
 		o.agentConfig = cfg.AgentConfig
 	}
+	if cfg.DashboardUser != "" {
+		o.dashboardUser = cfg.DashboardUser
+	}
+	if cfg.DashboardPass != "" {
+		o.dashboardPass = cfg.DashboardPass
+	}
 	if len(cfg.ACLPatterns) > 0 {
 		o.aclPatterns = append([]string(nil), cfg.ACLPatterns...)
 	}
@@ -133,6 +143,8 @@ func (o *relayOptions) applyEnvOverrides() {
 	o.secureListen = config.GetStringEnv("INTRATUN_RELAY_SECURE_LISTEN", o.secureListen)
 	o.socksListen = config.GetStringEnv("INTRATUN_RELAY_SOCKS_LISTEN", o.socksListen)
 	o.agentConfig = config.GetStringEnv("INTRATUN_RELAY_AGENT_CONFIG", o.agentConfig)
+	o.dashboardUser = config.GetStringEnv("INTRATUN_RELAY_DASHBOARD_USER", o.dashboardUser)
+	o.dashboardPass = config.GetStringEnv("INTRATUN_RELAY_DASHBOARD_PASS", o.dashboardPass)
 	if aclEnv := os.Getenv("INTRATUN_RELAY_ACL_ALLOW"); aclEnv != "" {
 		o.aclPatterns = splitAndTrim(aclEnv)
 	}
@@ -198,6 +210,8 @@ func NewCommand(globals *runtime.Options) *cobra.Command {
 	cmd.Flags().StringVar(&opts.secureListen, "secure-listen", opts.secureListen, "listen address for TLS endpoints (/tunnel, /, /metrics)")
 	cmd.Flags().StringVar(&opts.socksListen, "socks-listen", opts.socksListen, "optional listen address for SOCKS5 proxy (plain TCP)")
 	cmd.Flags().StringVar(&opts.agentConfig, "agent-config", "", "path to YAML file containing agent definitions")
+	cmd.Flags().StringVar(&opts.dashboardUser, "dashboard-user", "", "optional HTTP Basic Auth username for the dashboard")
+	cmd.Flags().StringVar(&opts.dashboardPass, "dashboard-pass", "", "optional HTTP Basic Auth password for the dashboard")
 	cmd.Flags().StringSliceVar(&opts.aclPatterns, "acl-allow", nil, "regex ACLs for allowed host:port destinations (repeatable)")
 	cmd.Flags().IntVar(&opts.maxFrame, "max-frame", opts.maxFrame, "maximum payload size per frame in bytes")
 	cmd.Flags().IntVar(&opts.maxInFlight, "max-inflight", opts.maxInFlight, "maximum queued bytes per stream when sending to clients (0 disables)")
