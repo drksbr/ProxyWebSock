@@ -1,6 +1,17 @@
 # Para throughput máximo em Linux, o relay roda em host networking.
 # Ajuste as variáveis no ambiente ou em um arquivo .env antes de subir.
 services:
+  relay-acme-init:
+    image: alpine:3.21
+    restart: "no"
+    user: "0:0"
+    command:
+      - sh
+      - -c
+      - mkdir -p /var/lib/intratun/acme && chown -R 65532:65532 /var/lib/intratun/acme
+    volumes:
+      - relay-acme:/var/lib/intratun/acme
+
   relay:
     build:
       context: .
@@ -10,6 +21,9 @@ services:
     restart: unless-stopped
     init: true
     network_mode: host
+    depends_on:
+      relay-acme-init:
+        condition: service_completed_successfully
     cap_add:
       - NET_BIND_SERVICE
     security_opt:
@@ -27,7 +41,6 @@ services:
       INTRATUN_LOG_LEVEL: "info"
     volumes:
       - ./config/agents.example.yaml:/etc/intratun/agents.yaml:ro
-      - ./bin:/var/lib/intratun/updates:ro
       - relay-acme:/var/lib/intratun/acme
     command:
       - relay

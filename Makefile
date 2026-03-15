@@ -129,11 +129,7 @@ release: clean web-build
 
 release-bin: clean web-build $(BIN_DIR)
 	@echo "Building colocated update binaries into $(BIN_DIR)..."
-	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -ldflags="-s -w" -o $(BIN_DIR)/intratun-linux-amd64 $(CMD)
-	@CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -trimpath -ldflags="-s -w" -o $(BIN_DIR)/intratun-linux-arm64 $(CMD)
-	@CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -ldflags="-s -w" -o $(BIN_DIR)/intratun-darwin-arm64 $(CMD)
-	@CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -trimpath -ldflags="-s -w" -o $(BIN_DIR)/intratun-windows-amd64.exe $(CMD)
-	@cd $(BIN_DIR) && shasum -a 256 intratun-* > SHA256SUMS
+	@bash scripts/build-update-binaries.sh $(BIN_DIR)
 
 profiles: bench-profile
 

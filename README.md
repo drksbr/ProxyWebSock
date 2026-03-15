@@ -266,6 +266,7 @@ Notes:
 - By default the relay generates the manifest itself and looks for agent binaries in the same directory as the relay executable.
 - `--updates-dir` overrides that directory when you want to keep release artifacts elsewhere.
 - `make release-bin` builds the artifact names that the relay auto-update endpoint already expects and writes `SHA256SUMS`.
+- The Docker image now bakes those release binaries into `/var/lib/intratun/updates`, so dashboard downloads work without mounting `./bin`.
 - The manifest is expected to be served over HTTP(S).
 - Windows self-update is not supported yet.
 
@@ -276,13 +277,22 @@ The repository now ships with `docker-compose.yaml` tuned for relay throughput o
 - `network_mode: host` to avoid Docker NAT on the proxy and SOCKS5 path.
 - `nofile` raised to `1048576`.
 - ACME cache persisted in a named volume.
-- Agent binaries mounted from `./bin` so dashboard downloads and auto-update share the same artifacts.
+- A small `relay-acme-init` service fixes the ACME volume ownership for the relay `nonroot` user before startup.
+- The Docker image itself already contains the release binaries in `/var/lib/intratun/updates`, so dashboard downloads and auto-update work out of the box.
 - Dashboard auth required through `INTRATUN_DASHBOARD_USER` / `INTRATUN_DASHBOARD_PASS`.
 
 Start it with:
 
 ```bash
 docker compose up -d --build
+```
+
+If you already created the `relay-acme` volume before this fix and the logs show `permission denied` or `acme/autocert: missing certificate`, repair it once and recreate the relay:
+
+```bash
+docker compose down
+docker compose run --rm relay-acme-init
+docker compose up -d --build --force-recreate
 ```
 
 ## Observability
