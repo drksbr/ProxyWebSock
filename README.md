@@ -280,6 +280,7 @@ The repository now ships with `docker-compose.yaml` tuned for relay throughput o
 - A small `relay-acme-init` service fixes the ACME volume ownership for the relay `nonroot` user before startup.
 - The Docker image itself already contains the release binaries in `/var/lib/intratun/updates`, so dashboard downloads and auto-update work out of the box.
 - Dashboard auth required through `INTRATUN_DASHBOARD_USER` / `INTRATUN_DASHBOARD_PASS`.
+- The Docker build compiles the update artifacts in separate steps to reduce peak disk usage during cross-builds.
 
 Start it with:
 
@@ -292,6 +293,13 @@ If you already created the `relay-acme` volume before this fix and the logs show
 ```bash
 docker compose down
 docker compose run --rm relay-acme-init
+docker compose up -d --build --force-recreate
+```
+
+If the Docker host already exhausted builder storage and the image build fails with `no space left on device`, clean old BuildKit layers once before rebuilding:
+
+```bash
+docker builder prune -af
 docker compose up -d --build --force-recreate
 ```
 

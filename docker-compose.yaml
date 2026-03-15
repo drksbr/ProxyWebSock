@@ -8,7 +8,7 @@ services:
     command:
       - sh
       - -c
-      - mkdir -p /var/lib/intratun/acme && chown -R 65532:65532 /var/lib/intratun/acme
+      - mkdir -p /var/lib/intratun/acme && chown -R 65532:65532 /var/lib/intratun/acme && chmod 700 /var/lib/intratun/acme
     volumes:
       - relay-acme:/var/lib/intratun/acme
 
