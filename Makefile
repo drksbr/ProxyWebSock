@@ -46,7 +46,7 @@ else
 endif
 
 .PHONY: all build fmt vet lint test race soak bench bench-profile fuzz cover tidy generate tools clean release release-bin \
-	 run-relay run-relay-debug run-agent run-agent-debug relay-start relay-stop relay-restart \
+	 run run-relay run-relay-debug run-agent run-agent-debug relay-start relay-stop relay-restart \
 	 web-install web-build web-dev mkln version-sync update docker-build docker-run docker-push compose-up compose-down profiles
 
 all: build
@@ -142,6 +142,20 @@ update:
 
 clean:
 	@rm -rf $(BIN_DIR) $(ARTIFACT_DIR)
+
+run: build
+	@[ -f .env ] || (echo "Arquivo .env não encontrado. Copie .env.example ou crie um com as variáveis necessárias."; exit 1)
+	@source .env && $(BINARY) relay \
+		--agent-config ./config/agents.example.yaml \
+		--acme-host=$${INTRATUN_ACME_HOST:?defina INTRATUN_ACME_HOST em .env} \
+		--acme-email=$${INTRATUN_ACME_EMAIL:?defina INTRATUN_ACME_EMAIL em .env} \
+		--acme-cache=/var/lib/intratun/acme \
+		--acme-http=:80 \
+		--proxy-listen=:8080 \
+		--secure-listen=:443 \
+		--socks-listen=:1080 \
+		--dashboard-user=$${INTRATUN_DASHBOARD_USER:?defina INTRATUN_DASHBOARD_USER em .env} \
+		--dashboard-pass=$${INTRATUN_DASHBOARD_PASS:?defina INTRATUN_DASHBOARD_PASS em .env}
 
 run-relay:
 	$(BINARY) $(RELAY_ARGS)
