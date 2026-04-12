@@ -71,10 +71,15 @@ RUN mkdir -p /var/lib/intratun/acme /var/lib/intratun/updates \
     && chmod 755 /var/lib/intratun/updates \
     && chown -R 65532:65532 /var/lib/intratun
 
+FROM debian:12-slim AS cap-setter
+RUN apt-get update -qq && apt-get install -y --no-install-recommends libcap2-bin && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/intratun /usr/local/bin/intratun
+RUN setcap cap_net_bind_service+ep /usr/local/bin/intratun
+
 FROM gcr.io/distroless/base-debian12:nonroot
 
 COPY --from=runtime-prep /var/lib/intratun /var/lib/intratun
-COPY --from=build /out/intratun /usr/local/bin/intratun
+COPY --from=cap-setter /usr/local/bin/intratun /usr/local/bin/intratun
 COPY --from=build --chown=nonroot:nonroot /out/updates/ /var/lib/intratun/updates/
 
 ENTRYPOINT ["/usr/local/bin/intratun"]

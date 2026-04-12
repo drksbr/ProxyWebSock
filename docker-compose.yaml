@@ -8,9 +8,12 @@ services:
     command:
       - sh
       - -c
-      - mkdir -p /var/lib/intratun/acme && chown -R 65532:65532 /var/lib/intratun/acme && chmod 700 /var/lib/intratun/acme
+      - |
+        mkdir -p /var/lib/intratun/acme && chown -R 65532:65532 /var/lib/intratun/acme && chmod 700 /var/lib/intratun/acme
+        mkdir -p /var/lib/intratun/data && chown -R 65532:65532 /var/lib/intratun/data && chmod 700 /var/lib/intratun/data
     volumes:
       - relay-acme:/var/lib/intratun/acme
+      - relay-data:/var/lib/intratun/data
 
   relay:
     build:
@@ -26,8 +29,6 @@ services:
         condition: service_completed_successfully
     cap_add:
       - NET_BIND_SERVICE
-    security_opt:
-      - no-new-privileges:true
     read_only: true
     stop_grace_period: 15s
     tmpfs:
@@ -42,6 +43,7 @@ services:
     volumes:
       - ./config/agents.example.yaml:/etc/intratun/agents.yaml:ro
       - relay-acme:/var/lib/intratun/acme
+      - relay-data:/var/lib/intratun/data
     command:
       - relay
       - --proxy-listen=:8080
@@ -57,9 +59,11 @@ services:
       - --dashboard-pass=${INTRATUN_DASHBOARD_PASS:?defina INTRATUN_DASHBOARD_PASS}
       - --max-frame=131072
       - --max-inflight=16777216
+      - --control-plane-db=/var/lib/intratun/data/controlplane.db
       - --stream-queue-depth=2048
       - --dial-timeout-ms=10000
       - --ws-idle=45s
 
 volumes:
   relay-acme:
+  relay-data:
