@@ -270,6 +270,7 @@ func (s *relayServer) run(ctx context.Context) error {
 	}
 
 	proxyMux := http.NewServeMux()
+	proxyMux.Handle("/tunnel", http.HandlerFunc(s.handleTunnel))
 	proxyMux.HandleFunc("/", s.handleProxy)
 	s.proxySrv = &http.Server{
 		Addr:              s.opts.proxyListen,

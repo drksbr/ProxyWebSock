@@ -113,8 +113,11 @@ func (a *agent) connectOnce(ctx context.Context) error {
 
 	conn, resp, err := dialer.DialContext(ctx, a.opts.relayURL, header)
 	if err != nil {
-		if resp != nil && resp.Body != nil {
-			resp.Body.Close()
+		if resp != nil {
+			if resp.Body != nil {
+				resp.Body.Close()
+			}
+			return fmt.Errorf("%w (http %d)", err, resp.StatusCode)
 		}
 		return err
 	}
