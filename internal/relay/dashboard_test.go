@@ -86,6 +86,11 @@ func TestAvailableDashboardDownloads(t *testing.T) {
 		updatesDir:     tempDir,
 		executablePath: filepath.Join(tempDir, "relay"),
 	}
+	updateManager, err := newUpdateManager(server.logger, tempDir)
+	if err != nil {
+		t.Fatalf("new update manager: %v", err)
+	}
+	server.updateManager = updateManager
 
 	req := httptest.NewRequest(http.MethodGet, "https://relay.example.com/status.json", nil)
 	downloads := server.availableDashboardDownloads(req)

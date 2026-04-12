@@ -19,8 +19,8 @@ GO_FILES := $(shell find . -type f -name '*.go' -not -path './web/node_modules/*
 GOLANGCI_LINT := $(shell command -v golangci-lint 2>/dev/null)
 GOTESTSUM := $(shell command -v gotestsum 2>/dev/null)
 
-RELAY_ARGS := relay --agent-config ./config/agents.example.yaml --stream-id-mode=cuid --proxy-listen=:8080 --secure-listen=:443 --socks-listen=:1080 --acme-host=relay.neurocirurgiahgrs.com.br --acme-email=admin@ncr.com.br --acme-cache=/var/lib/intratun/acme --acme-http=:80 --log-level=error
-AGENT_ARGS := agent --relay=wss://relay.neurocirurgiahgrs.com.br/tunnel --id=agente01 --token=troque-esta-senha --dial-timeout-ms=30000 --max-frame=8192 --read-buf=16384 --write-buf=16384 --log-level=error
+RELAY_ARGS := relay --agent-config ./config/agents.example.yaml --stream-id-mode=counter --proxy-listen=:8080 --secure-listen=:443 --socks-listen=:1080 --acme-host=relay.neurocirurgiahgrs.com.br --acme-email=admin@ncr.com.br --acme-cache=/var/lib/intratun/acme --acme-http=:80 --log-level=error
+AGENT_ARGS := agent --relay=wss://relay.neurocirurgiahgrs.com.br/tunnel --id=agente01 --token=troque-esta-senha --dial-timeout-ms=30000 --max-frame=131072 --max-inflight=16777216 --stream-queue-depth=512 --read-buf=262144 --write-buf=262144 --log-level=info
 
 
 .DEFAULT_GOAL := build
@@ -45,7 +45,7 @@ else
   $(error Unsupported package manager "$(PM)". Set PM=bun|npm|pnpm|yarn)
 endif
 
-.PHONY: all build fmt vet lint test race bench bench-profile fuzz cover tidy generate tools clean release release-bin \
+.PHONY: all build fmt vet lint test race soak bench bench-profile fuzz cover tidy generate tools clean release release-bin \
 	 run-relay run-relay-debug run-agent run-agent-debug relay-start relay-stop relay-restart \
 	 web-install web-build web-dev mkln version-sync update docker-build docker-run docker-push compose-up compose-down profiles
 
@@ -104,16 +104,19 @@ endif
 race:
 	@$(GO) test -race ./...
 
+soak:
+	@$(GO) test -count=1 ./internal/agent ./internal/relay -run 'Test(DialResolverSoakUnderDNSInstability|RouteResolutionSoakDuringAgentReconnectStorm|RouteResolutionSoakDuringAgentRestart|RouteResolutionSoakDuringRelayRestart)$$'
+
 bench:
 	@$(GO) test -run=^$$ -bench=. -benchmem ./...
 
 bench-profile: $(ARTIFACT_DIR)
-	@$(GO) test -run=^$$ -bench=EncodeBinaryFramePooled -cpuprofile=$(PROFILE_CPU) -memprofile=$(PROFILE_MEM) ./internal/protocol
+	@$(GO) test -run=^$$ -bench=EncodeDataPacketPooled -cpuprofile=$(PROFILE_CPU) -memprofile=$(PROFILE_MEM) ./internal/protocol
 	@echo "CPU profile written to $(PROFILE_CPU)"
 	@echo "Memory profile written to $(PROFILE_MEM)"
 
 fuzz:
-	@$(GO) test ./internal/protocol -run=^$$ -fuzz=FuzzDecodeBinaryFrame -fuzztime=10s
+	@$(GO) test ./internal/protocol -run=^$$ -fuzz=FuzzDecodeDataPacket -fuzztime=10s
 
 cover: $(ARTIFACT_DIR)
 	@$(GO) test ./... -coverprofile=$(COVER_FILE)

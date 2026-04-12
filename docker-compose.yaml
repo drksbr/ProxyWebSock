@@ -56,7 +56,7 @@ services:
       - --dashboard-user=${INTRATUN_DASHBOARD_USER:?defina INTRATUN_DASHBOARD_USER}
       - --dashboard-pass=${INTRATUN_DASHBOARD_PASS:?defina INTRATUN_DASHBOARD_PASS}
       - --max-frame=131072
-      - --max-inflight=4194304
+      - --max-inflight=16777216
       - --stream-queue-depth=2048
       - --dial-timeout-ms=10000
       - --ws-idle=45s

@@ -1,13 +1,13 @@
 package relay
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,11 +23,11 @@ const (
 )
 
 type outboundMessage struct {
-	frame          *protocol.Frame
-	binaryStreamID string
-	binaryPayload  []byte
-	control        *controlMessage
-	onWrite        func(success bool)
+	packet          []byte
+	binaryStreamID  uint64
+	binaryPayload   []byte
+	control         *controlMessage
+	onWriteComplete func(success bool)
 }
 
 type controlMessage struct {
@@ -44,13 +44,19 @@ type relayAgentSession struct {
 	id             string
 	identification string
 	location       string
+	goos           string
+	goarch         string
+	currentVersion string
 	acl            []*regexp.Regexp
 	aclPatterns    []string
 	remote         string
 	connectedAt    time.Time
 
-	streams   map[string]*relayStream
+	streams   map[uint64]*relayStream
 	streamsMu sync.RWMutex
+
+	diagnosticsMu sync.Mutex
+	diagnostics   map[uint64]chan protocol.DiagnosticResponse
 
 	shutdown chan struct{}
 	closed   bool
@@ -99,7 +105,8 @@ func newRelayAgentSession(server *relayServer, conn *websocket.Conn, remote stri
 		conn:         conn,
 		logger:       sessionLogger,
 		remote:       remote,
-		streams:      make(map[string]*relayStream),
+		streams:      make(map[uint64]*relayStream),
+		diagnostics:  make(map[uint64]chan protocol.DiagnosticResponse),
 		shutdown:     make(chan struct{}),
 		controlQueue: make(chan outboundMessage, 128),
 		dataQueue:    make(chan outboundMessage, 256),
@@ -148,14 +155,14 @@ func (s *relayAgentSession) writerLoop() {
 					continue
 				}
 				if err := s.writeMessage(&msg); err != nil {
-					if msg.onWrite != nil {
-						msg.onWrite(false)
+					if msg.onWriteComplete != nil {
+						msg.onWriteComplete(false)
 					}
 					s.logger.Warn("writer failed", "error", err)
 					return
 				}
-				if msg.onWrite != nil {
-					msg.onWrite(true)
+				if msg.onWriteComplete != nil {
+					msg.onWriteComplete(true)
 				}
 				continue
 			default:
@@ -188,14 +195,14 @@ func (s *relayAgentSession) writerLoop() {
 			}
 		}
 		if err := s.writeMessage(&msg); err != nil {
-			if msg.onWrite != nil {
-				msg.onWrite(false)
+			if msg.onWriteComplete != nil {
+				msg.onWriteComplete(false)
 			}
 			s.logger.Warn("writer failed", "error", err)
 			return
 		}
-		if msg.onWrite != nil {
-			msg.onWrite(true)
+		if msg.onWriteComplete != nil {
+			msg.onWriteComplete(true)
 		}
 	}
 }
@@ -212,13 +219,12 @@ func (s *relayAgentSession) writeMessage(msg *outboundMessage) error {
 		}
 		return s.conn.WriteControl(ctrl.messageType, ctrl.data, time.Now().Add(deadline))
 	}
-	if msg.frame != nil {
+	if len(msg.packet) > 0 {
 		if err := s.conn.SetWriteDeadline(time.Now().Add(20 * time.Second)); err != nil {
 			return err
 		}
-		writeErr := s.conn.WriteJSON(msg.frame)
-		if writeErr != nil {
-			return writeErr
+		if err := s.conn.WriteMessage(websocket.BinaryMessage, msg.packet); err != nil {
+			return err
 		}
 		if err := s.conn.SetWriteDeadline(time.Time{}); err != nil {
 			s.logger.Debug("reset write deadline failed", "error", err)
@@ -233,7 +239,7 @@ func (s *relayAgentSession) writeMessage(msg *outboundMessage) error {
 		if err != nil {
 			return err
 		}
-		writeErr := protocol.WriteBinaryFrame(writer, msg.binaryStreamID, msg.binaryPayload)
+		writeErr := protocol.WriteDataPacket(writer, msg.binaryStreamID, msg.binaryPayload)
 		closeErr := writer.Close()
 		if writeErr == nil {
 			writeErr = closeErr
@@ -313,7 +319,7 @@ func (s *relayAgentSession) run() {
 }
 
 func (s *relayAgentSession) performRegister() error {
-	readLimit := int64(s.server.opts.maxFrame + 1024)
+	readLimit := int64(s.server.opts.maxFrame + 64*1024)
 	if readLimit < 1<<20 {
 		readLimit = 1 << 20
 	}
@@ -322,26 +328,42 @@ func (s *relayAgentSession) performRegister() error {
 		return err
 	}
 
-	var f protocol.Frame
-	if err := s.conn.ReadJSON(&f); err != nil {
+	messageType, r, err := s.conn.NextReader()
+	if err != nil {
 		return fmt.Errorf("read register: %w", err)
 	}
-	if f.Type != protocol.FrameTypeRegister {
-		return errors.New("first frame must be register")
+	if messageType != websocket.BinaryMessage {
+		return errors.New("register packet must be binary")
 	}
-	if f.AgentID == "" {
-		return errors.New("register missing agentId")
+	header, body, release, err := protocol.ReadPacketPooled(r, s.server.opts.maxFrame+64*1024)
+	if err != nil {
+		return fmt.Errorf("read register: %w", err)
 	}
-	record, ok := s.server.authenticateAgent(f.AgentID, f.Token)
+	defer release()
+
+	req, err := protocol.DecodeRegisterPacket(header, body)
+	if err != nil {
+		return fmt.Errorf("decode register: %w", err)
+	}
+	if req.AgentID == "" {
+		return errors.New("register missing agent id")
+	}
+	record, ok := s.server.authenticateAgent(req.AgentID, req.Token)
 	if !ok {
 		return errors.New("invalid credentials")
 	}
 	s.id = record.Login
 	s.identification = record.Identification
 	s.location = record.Location
+	s.goos = strings.TrimSpace(req.GOOS)
+	s.goarch = strings.TrimSpace(req.GOARCH)
+	s.currentVersion = strings.TrimSpace(req.Version)
 	s.acl = record.ACL
 	if len(record.ACLPatterns) > 0 {
 		s.aclPatterns = append([]string(nil), record.ACLPatterns...)
+	}
+	if s.server.updateManager != nil {
+		s.server.updateManager.observeRuntime(s.id, s.currentVersion, s.goos, s.goarch)
 	}
 	attrs := []any{slog.String("agent", s.id)}
 	if s.identification != "" {
@@ -381,71 +403,94 @@ func (s *relayAgentSession) readLoop() {
 			}
 			return
 		}
-
-		switch messageType {
-		case websocket.BinaryMessage:
-			streamID, payload, release, err := protocol.ReadBinaryFramePooled(r, s.server.opts.maxFrame+1024)
+		if messageType != websocket.BinaryMessage {
+			continue
+		}
+		header, body, release, err := protocol.ReadPacketPooled(r, s.server.opts.maxFrame+64*1024)
+		if err != nil {
+			s.logger.Warn("packet read failed", "error", err)
+			return
+		}
+		switch header.Type {
+		case protocol.PacketTypeDialResponse:
+			resp, err := protocol.DecodeDialResponsePacket(header, body)
+			release()
 			if err != nil {
-				s.logger.Warn("binary read failed", "error", err)
+				s.logger.Warn("dial response decode failed", "error", err)
 				return
 			}
-			s.handleBinaryWrite(streamID, payload, release)
-		case websocket.TextMessage:
-			var f protocol.Frame
-			if err := json.NewDecoder(r).Decode(&f); err != nil {
-				s.logger.Warn("frame decode failed", "error", err)
+			s.handleDialAck(resp)
+		case protocol.PacketTypeDiagnosticResponse:
+			resp, err := protocol.DecodeDiagnosticResponsePacket(header, body)
+			release()
+			if err != nil {
+				s.logger.Warn("diagnostic response decode failed", "error", err)
 				return
 			}
-			switch f.Type {
-			case protocol.FrameTypeDial:
-				s.handleDialAck(f)
-			case protocol.FrameTypeWrite:
-				s.handleWrite(f)
-			case protocol.FrameTypeWindow:
-				s.handleWindow(f)
-			case protocol.FrameTypeClose:
-				s.handleClose(f)
-			case protocol.FrameTypeError:
-				s.handleError(f)
-			case protocol.FrameTypeHeartbeat:
-				s.handleHeartbeat(f)
-			default:
-				s.logger.Warn("unknown frame type", "type", f.Type)
+			s.handleDiagnosticResponse(resp)
+		case protocol.PacketTypeData:
+			streamID := header.StreamID
+			s.handleBinaryWrite(streamID, body, release)
+		case protocol.PacketTypeWindowUpdate:
+			update, err := protocol.DecodeWindowUpdatePacket(header, body)
+			release()
+			if err != nil {
+				s.logger.Warn("window decode failed", "error", err)
+				return
 			}
+			s.handleWindow(update)
+		case protocol.PacketTypeClose:
+			closePacket, err := protocol.DecodeClosePacket(header, body)
+			release()
+			if err != nil {
+				s.logger.Warn("close decode failed", "error", err)
+				return
+			}
+			s.handleClose(closePacket)
+		case protocol.PacketTypeHeartbeat:
+			payload, err := protocol.DecodeHeartbeatPacket(header, body)
+			release()
+			if err != nil {
+				s.logger.Warn("heartbeat decode failed", "error", err)
+				return
+			}
+			s.handleHeartbeat(payload)
 		default:
-			// ignore other message types
+			release()
+			s.logger.Warn("unknown packet type", "type", header.Type)
 		}
 	}
 }
 
-func (s *relayAgentSession) handleDialAck(f protocol.Frame) {
-	stream := s.lookupStream(f.StreamID)
+func (s *relayAgentSession) handleDialAck(resp protocol.DialResponse) {
+	stream := s.lookupStream(resp.StreamID)
 	if stream == nil {
-		s.logger.Warn("dial ack for unknown stream", "stream", f.StreamID)
+		s.logger.Warn("dial ack for unknown stream", "stream", resp.StreamID)
 		return
 	}
-	if f.Error != "" {
-		stream.closeFromAgent(errors.New(f.Error))
+	if resp.DialAddress != "" || resp.ResolutionSource != "" {
+		stream.setResolvedTarget(resp.DialAddress, resp.ResolutionSource)
+	}
+	if resp.Error != "" {
+		stream.closeFromAgent(errors.New(resp.Error))
 		return
 	}
 	stream.markReady(nil)
 }
 
-func (s *relayAgentSession) handleWrite(f protocol.Frame) {
-	stream := s.lookupStream(f.StreamID)
-	if stream == nil {
-		s.logger.Debug("write for unknown stream", "stream", f.StreamID)
+func (s *relayAgentSession) handleDiagnosticResponse(resp protocol.DiagnosticResponse) {
+	ch := s.popDiagnosticWaiter(resp.RequestID)
+	if ch == nil {
+		s.logger.Debug("diagnostic response without waiter", "request", resp.RequestID)
 		return
 	}
-	payload, err := protocol.DecodePayload(f.Payload)
-	if err != nil {
-		s.logger.Warn("payload decode failed", "stream", f.StreamID, "error", err)
-		return
+	select {
+	case ch <- resp:
+	default:
 	}
-	s.handleBinaryWriteWithStream(stream, payload, nil)
 }
 
-func (s *relayAgentSession) handleBinaryWrite(streamID string, payload []byte, release func()) {
+func (s *relayAgentSession) handleBinaryWrite(streamID uint64, payload []byte, release func()) {
 	stream := s.lookupStream(streamID)
 	if stream == nil {
 		if release != nil {
@@ -475,76 +520,68 @@ func (s *relayAgentSession) handleBinaryWriteWithStream(stream *relayStream, pay
 			s.logger.Debug("enqueue to client failed", "stream", stream.id, "error", err)
 		}
 		stream.closeFromRelay(err)
-		return
 	}
 }
 
-func (s *relayAgentSession) handleWindow(f protocol.Frame) {
-	if f.Window <= 0 {
+func (s *relayAgentSession) handleWindow(update protocol.WindowUpdate) {
+	if update.Delta == 0 {
 		return
 	}
-	stream := s.lookupStream(f.StreamID)
+	stream := s.lookupStream(update.StreamID)
 	if stream == nil {
-		s.logger.Debug("window update for unknown stream", "stream", f.StreamID)
+		s.logger.Debug("window update for unknown stream", "stream", update.StreamID)
 		return
 	}
-	stream.release(f.Window)
+	stream.release(int(update.Delta))
 }
 
-func (s *relayAgentSession) handleClose(f protocol.Frame) {
-	stream := s.lookupStream(f.StreamID)
+func (s *relayAgentSession) handleClose(closePacket protocol.ClosePacket) {
+	stream := s.lookupStream(closePacket.StreamID)
 	if stream == nil {
 		return
 	}
-	stream.closeFromAgent(nil)
-}
-
-func (s *relayAgentSession) handleError(f protocol.Frame) {
-	stream := s.lookupStream(f.StreamID)
-	if stream == nil {
-		s.logger.Warn("error frame for unknown stream", "stream", f.StreamID, "error", f.Error)
-		if f.Error != "" {
-			s.recordAgentError(f.Error)
-		}
+	if closePacket.Message != "" {
+		s.recordAgentError(closePacket.Message)
+	}
+	if closePacket.Code == protocol.CloseCodeOK {
+		stream.closeFromAgent(nil)
 		return
 	}
-	if f.Error != "" {
-		s.recordAgentError(f.Error)
-	}
-	stream.closeFromAgent(errors.New(f.Error))
+	stream.closeFromAgent(errors.New(closePacket.Message))
 }
 
-func (s *relayAgentSession) handleHeartbeat(f protocol.Frame) {
-	payload := f.Heartbeat
+func (s *relayAgentSession) handleHeartbeat(payload *protocol.HeartbeatPayload) {
 	if payload == nil {
-		s.logger.Warn("heartbeat frame missing payload")
+		s.logger.Warn("heartbeat packet missing payload")
 		return
 	}
 
 	now := time.Now()
 	switch payload.Mode {
-	case protocol.HeartbeatModePing, "":
+	case protocol.HeartbeatModePing, 0:
 		s.updateHeartbeatFromAgent(payload, now)
-		reply := &protocol.Frame{
-			Type: protocol.FrameTypeHeartbeat,
-			Heartbeat: &protocol.HeartbeatPayload{
-				Sequence: payload.Sequence,
-				SentAt:   payload.SentAt,
-				Mode:     protocol.HeartbeatModePong,
-			},
+		reply, err := protocol.EncodeHeartbeatPacket(&protocol.HeartbeatPayload{
+			Sequence: payload.Sequence,
+			SentAt:   payload.SentAt,
+			Mode:     protocol.HeartbeatModePong,
+		})
+		if err != nil {
+			s.logger.Debug("heartbeat pong encode failed", "error", err)
+			s.markHeartbeatFailure()
+			return
 		}
-		if err := s.send(reply); err != nil {
+		if err := s.sendPacket(reply); err != nil {
 			s.logger.Debug("heartbeat pong failed", "error", err)
 			s.markHeartbeatFailure()
 		}
 	case protocol.HeartbeatModePong:
 		s.updateHeartbeatAck(payload, now)
 	default:
-		s.logger.Warn("heartbeat frame with unknown mode", "mode", payload.Mode)
+		s.logger.Warn("heartbeat packet with unknown mode", "mode", payload.Mode)
 	}
 }
 
-func (s *relayAgentSession) lookupStream(id string) *relayStream {
+func (s *relayAgentSession) lookupStream(id uint64) *relayStream {
 	s.streamsMu.RLock()
 	defer s.streamsMu.RUnlock()
 	return s.streams[id]
@@ -557,14 +594,14 @@ func (s *relayAgentSession) registerStream(stream *relayStream) error {
 		return errors.New("agent not registered")
 	}
 	if _, exists := s.streams[stream.id]; exists {
-		return fmt.Errorf("stream %s already exists", stream.id)
+		return fmt.Errorf("stream %d already exists", stream.id)
 	}
 	s.streams[stream.id] = stream
 	s.server.metrics.activeStreams.Inc()
 	return nil
 }
 
-func (s *relayAgentSession) removeStream(streamID string) {
+func (s *relayAgentSession) removeStream(streamID uint64) {
 	s.streamsMu.Lock()
 	defer s.streamsMu.Unlock()
 	if _, ok := s.streams[streamID]; ok {
@@ -573,29 +610,48 @@ func (s *relayAgentSession) removeStream(streamID string) {
 	}
 }
 
-func (s *relayAgentSession) send(f *protocol.Frame) error {
-	if f == nil {
+func (s *relayAgentSession) sendPacket(packet []byte) error {
+	if len(packet) == 0 {
 		return nil
 	}
-	return s.enqueueControl(outboundMessage{frame: f})
+	return s.enqueueControl(outboundMessage{packet: packet})
 }
 
-func (s *relayAgentSession) sendWindowUpdate(streamID string, delta int) error {
+func (s *relayAgentSession) sendDial(req protocol.DialRequest) error {
+	packet, err := protocol.EncodeDialRequestPacket(req)
+	if err != nil {
+		return err
+	}
+	return s.sendPacket(packet)
+}
+
+func (s *relayAgentSession) sendClose(closePacket protocol.ClosePacket) error {
+	packet, err := protocol.EncodeClosePacket(closePacket)
+	if err != nil {
+		return err
+	}
+	return s.sendPacket(packet)
+}
+
+func (s *relayAgentSession) sendWindowUpdate(streamID uint64, delta int) error {
 	if delta <= 0 {
 		return nil
 	}
-	return s.send(&protocol.Frame{
-		Type:     protocol.FrameTypeWindow,
+	packet, err := protocol.EncodeWindowUpdatePacket(protocol.WindowUpdate{
 		StreamID: streamID,
-		Window:   delta,
+		Delta:    uint32(delta),
 	})
+	if err != nil {
+		return err
+	}
+	return s.sendPacket(packet)
 }
 
-func (s *relayAgentSession) sendBinary(streamID string, payload []byte, release func()) error {
+func (s *relayAgentSession) sendBinary(streamID uint64, payload []byte, release func()) error {
 	msg := outboundMessage{
 		binaryStreamID: streamID,
 		binaryPayload:  payload,
-		onWrite: func(bool) {
+		onWriteComplete: func(bool) {
 			if release != nil {
 				release()
 			}
@@ -608,6 +664,14 @@ func (s *relayAgentSession) sendBinary(streamID string, payload []byte, release 
 		return err
 	}
 	return nil
+}
+
+func (s *relayAgentSession) sendUpdateCommand() error {
+	packet, err := protocol.EncodeUpdatePacket()
+	if err != nil {
+		return err
+	}
+	return s.sendPacket(packet)
 }
 
 func (s *relayAgentSession) sendControl(messageType int) error {
@@ -634,6 +698,13 @@ func (s *relayAgentSession) close() {
 	if s.id != "" {
 		s.server.unregisterAgent(s.id)
 	}
+	s.diagnosticsMu.Lock()
+	if len(s.diagnostics) > 0 {
+		for requestID := range s.diagnostics {
+			delete(s.diagnostics, requestID)
+		}
+	}
+	s.diagnosticsMu.Unlock()
 	var streams []*relayStream
 	s.streamsMu.Lock()
 	if len(s.streams) > 0 {
@@ -748,6 +819,9 @@ func (s *relayAgentSession) snapshot() statusAgent {
 		ID:             s.id,
 		Identification: s.identification,
 		Location:       s.location,
+		GOOS:           s.goos,
+		GOARCH:         s.goarch,
+		CurrentVersion: s.currentVersion,
 		Remote:         s.remote,
 		ConnectedAt:    s.connectedAt,
 		Status:         "connected",
@@ -827,7 +901,6 @@ func (s *relayAgentSession) snapshot() statusAgent {
 	if agentControlQueue > 0 {
 		agent.AgentControlQueueDepth = agentControlQueue
 	}
-
 	if agentDataQueue > 0 {
 		agent.AgentDataQueueDepth = agentDataQueue
 	}

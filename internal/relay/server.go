@@ -17,11 +17,11 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/drksbr/ProxyWebSock/internal/controlplane"
 	"github.com/gorilla/websocket"
-	"github.com/lucsky/cuid"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/crypto/acme/autocert"
 )
@@ -51,11 +51,17 @@ type relayServer struct {
 	socksLn     net.Listener
 	stats       relayCounters
 	resources   *resourceTracker
+	control     controlplane.Store
 
 	staticFS       fs.FS
 	updatesDir     string
 	executablePath string
-	idGen          func() string
+	updateManager  *updateManager
+	dnsOverrides   *dnsOverrideStore
+	routeHistory   *routeHistory
+	diagnosticRuns *diagnosticHistory
+	breakers       *circuitBreakerRegistry
+	streamSeq      atomic.Uint64
 }
 
 type agentRecord struct {
@@ -122,6 +128,35 @@ func newRelayServer(logger *slog.Logger, opts *relayOptions) (*relayServer, erro
 	} else if !info.IsDir() {
 		return nil, fmt.Errorf("updates dir %q is not a directory", updatesDir)
 	}
+	dnsOverridesFile := strings.TrimSpace(opts.dnsOverridesFile)
+	if dnsOverridesFile == "" {
+		dnsOverridesFile = filepath.Join(filepath.Dir(opts.agentConfig), "dns-overrides.yaml")
+	}
+	dnsOverrides, err := newDNSOverrideStore(dnsOverridesFile)
+	if err != nil {
+		return nil, fmt.Errorf("prepare dns override store: %w", err)
+	}
+	controlPlaneDB := strings.TrimSpace(opts.controlPlaneDB)
+	if controlPlaneDB == "" {
+		controlPlaneDB = filepath.Join(filepath.Dir(opts.agentConfig), "controlplane.db")
+	}
+	var controlStore controlplane.Store
+	switch strings.ToLower(controlPlaneDB) {
+	case "memory", ":memory:", "mem", "off":
+		controlStore = controlplane.NewMemoryStore()
+	default:
+		controlStore, err = controlplane.NewSQLiteStore(controlPlaneDB)
+		if err != nil {
+			return nil, fmt.Errorf("prepare control-plane store: %w", err)
+		}
+	}
+	if err := bootstrapLegacyControlPlane(context.Background(), controlStore, agentDirectory); err != nil {
+		return nil, fmt.Errorf("bootstrap control plane: %w", err)
+	}
+	updateManager, err := newUpdateManager(logger.With("component", "updates"), updatesDir)
+	if err != nil {
+		return nil, fmt.Errorf("prepare update manager: %w", err)
+	}
 
 	acmeManager := &autocert.Manager{
 		Prompt:     autocert.AcceptTOS,
@@ -137,14 +172,10 @@ func newRelayServer(logger *slog.Logger, opts *relayOptions) (*relayServer, erro
 		return nil, fmt.Errorf("prepare dashboard assets: %w", err)
 	}
 
-	var idGen func() string
 	switch mode := strings.ToLower(strings.TrimSpace(opts.streamIDMode)); mode {
-	case "", "uuid":
-		idGen = uuid.NewString
-	case "cuid":
-		idGen = cuid.New
+	case "", "uuid", "cuid", "counter", "uint64":
 	default:
-		return nil, fmt.Errorf("unsupported stream id mode %q (use uuid or cuid)", opts.streamIDMode)
+		return nil, fmt.Errorf("unsupported stream id mode %q (use uuid, cuid, counter or uint64)", opts.streamIDMode)
 	}
 
 	indexHTMLBytes, err := fs.ReadFile(distFS, "index.html")
@@ -172,12 +203,17 @@ func newRelayServer(logger *slog.Logger, opts *relayOptions) (*relayServer, erro
 		agentDirectory: agentDirectory,
 		acl:            acl,
 		resources:      resources,
+		control:        controlStore,
 		acmeManager:    acmeManager,
 		statusTmpl:     tmpl,
 		staticFS:       distFS,
 		updatesDir:     updatesDir,
 		executablePath: executablePath,
-		idGen:          idGen,
+		dnsOverrides:   dnsOverrides,
+		routeHistory:   newRouteHistory(defaultRouteHistoryLimit),
+		diagnosticRuns: newDiagnosticHistory(defaultDiagnosticHistoryLimit),
+		breakers:       newCircuitBreakerRegistry(opts.breakerFailures, opts.breakerCooldown),
+		updateManager:  updateManager,
 		upgrader: websocket.Upgrader{
 			HandshakeTimeout:  10 * time.Second,
 			EnableCompression: false,
@@ -190,16 +226,18 @@ func newRelayServer(logger *slog.Logger, opts *relayOptions) (*relayServer, erro
 	}, nil
 }
 
-func (s *relayServer) nextStreamID() string {
-	if s.idGen != nil {
-		return s.idGen()
-	}
-	return uuid.NewString()
+func (s *relayServer) nextStreamID() uint64 {
+	return s.streamSeq.Add(1)
 }
 
 func (s *relayServer) run(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
 	defer s.cancel()
+	if closer, ok := s.control.(interface{ Close() error }); ok {
+		defer func() {
+			_ = closer.Close()
+		}()
+	}
 
 	if s.resources != nil {
 		s.resources.start(s.ctx)
@@ -249,6 +287,20 @@ func (s *relayServer) run(ctx context.Context) error {
 	secureMux.Handle("/tunnel", http.HandlerFunc(s.handleTunnel))
 	secureMux.Handle("/autoconfig/", http.HandlerFunc(s.handleAutoConfig))
 	secureMux.Handle("/status.json", s.dashboardAuth(http.HandlerFunc(s.handleStatusJSON)))
+	secureMux.Handle("/api/agents/", s.dashboardAuth(http.HandlerFunc(s.handleAgentDeploymentAPI)))
+	secureMux.Handle("/api/diagnostics", s.dashboardAuth(http.HandlerFunc(s.handleDiagnosticsAPI)))
+	secureMux.Handle("/api/control-plane/agent-groups", s.dashboardAuth(http.HandlerFunc(s.handleAgentGroupsAPI)))
+	secureMux.Handle("/api/control-plane/agent-groups/", s.dashboardAuth(http.HandlerFunc(s.handleAgentGroupsAPI)))
+	secureMux.Handle("/api/control-plane/agent-memberships", s.dashboardAuth(http.HandlerFunc(s.handleAgentMembershipsAPI)))
+	secureMux.Handle("/api/control-plane/agent-memberships/", s.dashboardAuth(http.HandlerFunc(s.handleAgentMembershipsAPI)))
+	secureMux.Handle("/api/control-plane/destination-profiles", s.dashboardAuth(http.HandlerFunc(s.handleDestinationProfilesAPI)))
+	secureMux.Handle("/api/control-plane/destination-profiles/", s.dashboardAuth(http.HandlerFunc(s.handleDestinationProfilesAPI)))
+	secureMux.Handle("/api/control-plane/access-grants", s.dashboardAuth(http.HandlerFunc(s.handleAccessGrantsAPI)))
+	secureMux.Handle("/api/control-plane/access-grants/", s.dashboardAuth(http.HandlerFunc(s.handleAccessGrantsAPI)))
+	secureMux.Handle("/api/control-plane/users", s.dashboardAuth(http.HandlerFunc(s.handleUsersAPI)))
+	secureMux.Handle("/api/control-plane/users/", s.dashboardAuth(http.HandlerFunc(s.handleUsersAPI)))
+	secureMux.Handle("/api/dns-overrides", s.dashboardAuth(http.HandlerFunc(s.handleDNSOverridesAPI)))
+	secureMux.Handle("/api/dns-overrides/", s.dashboardAuth(http.HandlerFunc(s.handleDNSOverridesAPI)))
 	secureMux.Handle("/downloads/", s.dashboardAuth(http.HandlerFunc(s.handleDashboardDownloads)))
 	secureMux.Handle("/updates/", http.HandlerFunc(s.handleUpdates))
 	if s.staticFS != nil {

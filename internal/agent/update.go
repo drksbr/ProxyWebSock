@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -65,7 +66,7 @@ func (a *agent) checkForUpdate(ctx context.Context) {
 		a.logger.Debug("update check failed", "error", err)
 		return
 	}
-	if !shouldUpdateVersion(version.Version, manifest.Version) {
+	if !shouldSyncVersion(version.Version, manifest.Version) {
 		return
 	}
 	if err := a.applyUpdate(ctx, manifest); err != nil {
@@ -86,7 +87,7 @@ func (a *agent) fetchUpdateManifest(ctx context.Context) (*updateManifest, error
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("intratun-agent/%s", version.Version))
+	a.decorateUpdateRequest(req)
 
 	client := &http.Client{Timeout: a.opts.updateTimeout}
 	resp, err := client.Do(req)
@@ -141,7 +142,8 @@ func (a *agent) applyUpdate(ctx context.Context, manifest *updateManifest) error
 		_ = os.Remove(tempPath)
 	}()
 
-	a.logger.Info("applying agent update", "from", version.Version, "to", manifest.Version, "url", downloadURL.String())
+	action := updateDirection(version.Version, manifest.Version)
+	a.logger.Info("applying agent update", "action", action, "from", version.Version, "to", manifest.Version, "url", downloadURL.String())
 	if err := swapExecutable(exePath, tempPath); err != nil {
 		return fmt.Errorf("replace executable: %w", err)
 	}
@@ -156,7 +158,7 @@ func (a *agent) downloadUpdatedBinary(ctx context.Context, downloadURL *url.URL,
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("User-Agent", fmt.Sprintf("intratun-agent/%s", version.Version))
+	a.decorateUpdateRequest(req)
 
 	client := &http.Client{Timeout: a.opts.updateTimeout}
 	resp, err := client.Do(req)
@@ -221,18 +223,44 @@ func resolveDownloadURL(base *url.URL, raw string) (*url.URL, error) {
 	return base.ResolveReference(ref), nil
 }
 
-func shouldUpdateVersion(current, target string) bool {
+func (a *agent) decorateUpdateRequest(req *http.Request) {
+	if req == nil {
+		return
+	}
+	req.Header.Set("User-Agent", fmt.Sprintf("intratun-agent/%s", version.Version))
+	req.Header.Set("X-Intratun-Version", version.Version)
+	req.Header.Set("X-Intratun-GOOS", runtime.GOOS)
+	req.Header.Set("X-Intratun-GOARCH", runtime.GOARCH)
+	if a == nil || a.opts == nil || a.opts.agentID == "" {
+		return
+	}
+	token := a.opts.agentID + ":" + a.opts.token
+	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(token)))
+}
+
+func shouldSyncVersion(current, target string) bool {
 	current = strings.TrimSpace(current)
 	target = strings.TrimSpace(target)
 	if current == "" || target == "" || current == target {
 		return false
 	}
+	return true
+}
+
+func updateDirection(current, target string) string {
 	cur, curOK := parseVersion(current)
 	next, nextOK := parseVersion(target)
 	if curOK && nextOK {
-		return compareParsedVersions(cur, next) < 0
+		switch compareParsedVersions(cur, next) {
+		case -1:
+			return "upgrade"
+		case 1:
+			return "downgrade"
+		default:
+			return "sync"
+		}
 	}
-	return target != current
+	return "sync"
 }
 
 func compareParsedVersions(a, b parsedVersion) int {

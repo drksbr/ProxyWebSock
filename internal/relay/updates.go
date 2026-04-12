@@ -13,10 +13,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"runtime"
 	"strings"
-
-	"github.com/drksbr/ProxyWebSock/internal/version"
 )
 
 type updateArtifact struct {
@@ -43,8 +40,10 @@ var dashboardDownloadTargets = []dashboardDownloadTarget{
 func (s *relayServer) handleUpdates(w http.ResponseWriter, r *http.Request) {
 	cleanPath := path.Clean("/" + strings.TrimPrefix(r.URL.Path, "/updates/"))
 	switch {
+	case cleanPath == "/agent/manifest":
+		s.handleAgentUpdateManifest(w, r)
 	case strings.HasPrefix(cleanPath, "/manifest-") && strings.HasSuffix(cleanPath, ".json"):
-		s.handleUpdateManifest(w, r, path.Base(cleanPath))
+		s.handlePublicUpdateManifest(w, r, path.Base(cleanPath))
 	case strings.HasPrefix(cleanPath, "/bin/"):
 		s.handleUpdateBinary(w, r, cleanPath)
 	default:
@@ -59,7 +58,7 @@ func (s *relayServer) handleDashboardDownloads(w http.ResponseWriter, r *http.Re
 		http.NotFound(w, r)
 		return
 	}
-	artifact, err := s.findUpdateArtifact(goos, goarch)
+	artifact, err := s.resolveUpdateArtifact("", goos, goarch)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			http.NotFound(w, r)
@@ -74,13 +73,13 @@ func (s *relayServer) handleDashboardDownloads(w http.ResponseWriter, r *http.Re
 	}
 }
 
-func (s *relayServer) handleUpdateManifest(w http.ResponseWriter, r *http.Request, name string) {
+func (s *relayServer) handlePublicUpdateManifest(w http.ResponseWriter, r *http.Request, name string) {
 	goos, goarch, ok := parseManifestName(name)
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	artifact, err := s.resolveUpdateArtifact(goos, goarch)
+	artifact, err := s.resolveUpdateArtifact("", goos, goarch)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			http.NotFound(w, r)
@@ -90,14 +89,69 @@ func (s *relayServer) handleUpdateManifest(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "update manifest error", http.StatusInternalServerError)
 		return
 	}
+	s.writeUpdateManifest(w, r, artifact)
+}
 
+func (s *relayServer) handleAgentUpdateManifest(w http.ResponseWriter, r *http.Request) {
+	agentID, token, ok := r.BasicAuth()
+	if !ok {
+		w.Header().Set("WWW-Authenticate", `Basic realm="intratun-agent-update", charset="UTF-8"`)
+		http.Error(w, "agent auth required", http.StatusUnauthorized)
+		return
+	}
+	if _, valid := s.authenticateAgent(agentID, token); !valid {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	goos := strings.TrimSpace(r.Header.Get("X-Intratun-GOOS"))
+	goarch := strings.TrimSpace(r.Header.Get("X-Intratun-GOARCH"))
+	versionText := strings.TrimSpace(r.Header.Get("X-Intratun-Version"))
+	if s.updateManager != nil {
+		s.updateManager.observeRuntime(agentID, versionText, goos, goarch)
+	}
+
+	status := agentDeploymentStatus{}
+	if s.updateManager != nil {
+		status = s.updateManager.deploymentStatus(agentID, goos, goarch)
+	}
+	if status.GOOS != "" {
+		goos = status.GOOS
+	}
+	if status.GOARCH != "" {
+		goarch = status.GOARCH
+	}
+	if goos == "" || goarch == "" {
+		http.Error(w, "missing agent platform headers", http.StatusBadRequest)
+		return
+	}
+
+	artifact, err := s.resolveUpdateArtifact(status.DesiredVersion, goos, goarch)
+	if err != nil {
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			http.Error(w, "requested deployment artifact not found", http.StatusConflict)
+		default:
+			s.logger.Warn("agent manifest resolve failed", "agent", agentID, "goos", goos, "goarch", goarch, "target_version", status.DesiredVersion, "error", err)
+			http.Error(w, "agent manifest error", http.StatusInternalServerError)
+		}
+		return
+	}
+	s.writeUpdateManifest(w, r, artifact)
+}
+
+func (s *relayServer) writeUpdateManifest(w http.ResponseWriter, r *http.Request, artifact *updateArtifact) {
+	if artifact == nil {
+		http.Error(w, "artifact not found", http.StatusNotFound)
+		return
+	}
 	payload := struct {
 		Version string `json:"version"`
 		URL     string `json:"url"`
 		SHA256  string `json:"sha256"`
 	}{
 		Version: artifact.Version,
-		URL:     s.externalUpdateURL(r, fmt.Sprintf("/updates/bin/%s/%s", goos, goarch)),
+		URL:     s.externalUpdateURL(r, fmt.Sprintf("/updates/bin/%s/%s/%s", artifact.Version, artifact.GOOS, artifact.GOARCH)),
 		SHA256:  artifact.SHA256,
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -108,18 +162,18 @@ func (s *relayServer) handleUpdateManifest(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *relayServer) handleUpdateBinary(w http.ResponseWriter, r *http.Request, cleanPath string) {
-	goos, goarch, ok := parseBinaryPath(cleanPath)
+	versionText, goos, goarch, ok := parseBinaryPath(cleanPath)
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	artifact, err := s.resolveUpdateArtifact(goos, goarch)
+	artifact, err := s.resolveUpdateArtifact(versionText, goos, goarch)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			http.NotFound(w, r)
 			return
 		}
-		s.logger.Warn("update binary resolve failed", "goos", goos, "goarch", goarch, "error", err)
+		s.logger.Warn("update binary resolve failed", "goos", goos, "goarch", goarch, "version", versionText, "error", err)
 		http.Error(w, "update binary error", http.StatusInternalServerError)
 		return
 	}
@@ -130,46 +184,17 @@ func (s *relayServer) handleUpdateBinary(w http.ResponseWriter, r *http.Request,
 	http.ServeFile(w, r, artifact.Path)
 }
 
-func (s *relayServer) resolveUpdateArtifact(goos, goarch string) (*updateArtifact, error) {
-	artifact, err := s.findUpdateArtifact(goos, goarch)
-	if err != nil {
-		return nil, err
+func (s *relayServer) resolveUpdateArtifact(versionText, goos, goarch string) (*updateArtifact, error) {
+	if s.updateManager == nil {
+		return nil, errors.New("update manager unavailable")
 	}
-	sum, err := sha256File(artifact.Path)
-	if err != nil {
-		return nil, err
-	}
-	artifact.SHA256 = sum
-	return artifact, nil
-}
-
-func (s *relayServer) findUpdateArtifact(goos, goarch string) (*updateArtifact, error) {
-	candidates := s.updateCandidates(goos, goarch)
-	for _, candidate := range candidates {
-		info, err := os.Stat(candidate)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-			return nil, err
-		}
-		if info.IsDir() {
-			continue
-		}
-		return &updateArtifact{
-			GOOS:    goos,
-			GOARCH:  goarch,
-			Path:    candidate,
-			Version: version.Version,
-		}, nil
-	}
-	return nil, os.ErrNotExist
+	return s.updateManager.resolveArtifact(versionText, goos, goarch)
 }
 
 func (s *relayServer) availableDashboardDownloads(r *http.Request) []statusDownload {
 	downloads := make([]statusDownload, 0, len(dashboardDownloadTargets))
 	for _, target := range dashboardDownloadTargets {
-		artifact, err := s.findUpdateArtifact(target.GOOS, target.GOARCH)
+		artifact, err := s.resolveUpdateArtifact("", target.GOOS, target.GOARCH)
 		if err != nil {
 			continue
 		}
@@ -185,21 +210,6 @@ func (s *relayServer) availableDashboardDownloads(r *http.Request) []statusDownl
 	return downloads
 }
 
-func (s *relayServer) updateCandidates(goos, goarch string) []string {
-	suffix := ""
-	if goos == "windows" {
-		suffix = ".exe"
-	}
-	candidates := []string{
-		filepath.Join(s.updatesDir, fmt.Sprintf("intratun-%s-%s%s", goos, goarch, suffix)),
-		filepath.Join(s.updatesDir, fmt.Sprintf("intratun-agent-%s-%s%s", goos, goarch, suffix)),
-	}
-	if goos == runtime.GOOS && goarch == runtime.GOARCH && s.executablePath != "" {
-		candidates = append(candidates, s.executablePath)
-	}
-	return dedupeStrings(candidates)
-}
-
 func parseManifestName(name string) (string, string, bool) {
 	if !strings.HasPrefix(name, "manifest-") || !strings.HasSuffix(name, ".json") {
 		return "", "", false
@@ -212,12 +222,16 @@ func parseManifestName(name string) (string, string, bool) {
 	return parts[0], parts[1], true
 }
 
-func parseBinaryPath(cleanPath string) (string, string, bool) {
+func parseBinaryPath(cleanPath string) (string, string, string, bool) {
 	parts := strings.Split(strings.TrimPrefix(cleanPath, "/"), "/")
-	if len(parts) != 3 || parts[0] != "bin" || parts[1] == "" || parts[2] == "" {
-		return "", "", false
+	switch {
+	case len(parts) == 3 && parts[0] == "bin" && parts[1] != "" && parts[2] != "":
+		return "", parts[1], parts[2], true
+	case len(parts) == 4 && parts[0] == "bin" && parts[1] != "" && parts[2] != "" && parts[3] != "":
+		return parts[1], parts[2], parts[3], true
+	default:
+		return "", "", "", false
 	}
-	return parts[1], parts[2], true
 }
 
 func parseDashboardDownloadPath(cleanPath string) (string, string, bool) {

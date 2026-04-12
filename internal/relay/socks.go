@@ -85,16 +85,17 @@ func (s *relayServer) handleSocksConn(conn net.Conn) {
 		return
 	}
 
-	agentID, token, err := readSocksCredentials(conn)
+	username, secret, err := readSocksCredentials(conn)
 	if err != nil {
 		logger.Debug("read credentials failed", "error", err)
 		return
 	}
-	if !s.validateAgent(agentID, token) {
+	principal, err := s.authenticateProxyPrincipal(s.ctx, username, secret)
+	if err != nil {
 		s.metrics.authFailures.Inc()
 		s.stats.authFailures.Add(1)
 		_, _ = conn.Write([]byte{0x01, 0x01})
-		logger.Warn("invalid credentials", "agent", agentID)
+		logger.Warn("invalid credentials", "user", username, "error", err)
 		return
 	}
 	if _, err := conn.Write([]byte{0x01, 0x00}); err != nil {
@@ -109,16 +110,16 @@ func (s *relayServer) handleSocksConn(conn net.Conn) {
 		return
 	}
 	targetHostPort := net.JoinHostPort(host, strconv.Itoa(port))
-	if err := s.authorizeTarget(agentID, targetHostPort); err != nil {
-		logger.Warn("acl denied", "target", targetHostPort)
-		_ = writeSocksReply(conn, 0x02)
-		return
+	session, decision, err := s.resolveRouteForPrincipal(s.ctx, principal, host, port)
+	if err == nil {
+		if quotaErr := s.enforceStreamQuotas(principal, decision); quotaErr != nil {
+			err = quotaErr
+		}
 	}
-
-	session, ok := s.lookupAgent(agentID)
-	if !ok {
-		logger.Warn("agent missing", "agent", agentID)
-		_ = writeSocksReply(conn, 0x05)
+	s.recordRouteOutcome("socks5", targetHostPort, principal, decision, err)
+	if err != nil {
+		logger.Warn("route resolution failed", "target", targetHostPort, "error", err)
+		_ = writeSocksReply(conn, routeSOCKSReply(err))
 		return
 	}
 
@@ -126,18 +127,14 @@ func (s *relayServer) handleSocksConn(conn net.Conn) {
 	stream := newRelayStream(streamID, session, streamProtoSOCKS5, conn, nil, host, port, s.opts.streamQueueDepth, func(delta int) error {
 		return session.sendWindowUpdate(streamID, delta)
 	})
+	stream.setRouting(decision)
 	if err := session.registerStream(stream); err != nil {
 		logger.Warn("register stream failed", "stream", streamID, "error", err)
 		_ = writeSocksReply(conn, 0x01)
 		return
 	}
 
-	if err := session.send(&protocol.Frame{
-		Type:     protocol.FrameTypeDial,
-		StreamID: streamID,
-		Host:     host,
-		Port:     port,
-	}); err != nil {
+	if err := session.sendDial(s.buildDialRequest(streamID, host, port)); err != nil {
 		logger.Warn("send dial failed", "stream", streamID, "error", err)
 		_ = writeSocksReply(conn, 0x01)
 		stream.closeSilent(err)
@@ -145,18 +142,20 @@ func (s *relayServer) handleSocksConn(conn net.Conn) {
 	}
 
 	if err := stream.waitReady(s.dialTimeout()); err != nil {
+		s.recordDestinationCircuitOutcome(decision.GroupID, decision.GroupName, stream.target(), err)
 		s.metrics.dialErrors.Inc()
 		s.stats.dialErrors.Add(1)
-		_ = session.send(&protocol.Frame{
-			Type:     protocol.FrameTypeClose,
+		_ = session.sendClose(protocol.ClosePacket{
 			StreamID: streamID,
-			Error:    err.Error(),
+			Code:     protocol.CloseCodeDialFailed,
+			Message:  err.Error(),
 		})
 		logger.Warn("dial timeout", "stream", streamID, "error", err)
 		_ = writeSocksReply(conn, 0x05)
 		stream.closeSilent(err)
 		return
 	}
+	s.recordDestinationCircuitOutcome(decision.GroupID, decision.GroupName, stream.target(), nil)
 
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		logger.Debug("clear deadline failed", "error", err)

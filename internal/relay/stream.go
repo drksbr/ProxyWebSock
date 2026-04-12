@@ -74,22 +74,33 @@ func releaseRelayBuffer(buf []byte) {
 }
 
 type relayStream struct {
-	id         string
-	agent      *relayAgentSession
-	client     net.Conn
-	bufrw      *bufio.ReadWriter
-	protocol   streamProtocol
-	targetHost string
-	targetPort int
-	createdAt  time.Time
-	once       sync.Once
-	closing    chan struct{}
-	readyCh    chan error
-	readyOnce  sync.Once
-	handshake  chan struct{}
-	bytesUp    atomic.Int64
-	bytesDown  atomic.Int64
-	spanID     string
+	id               uint64
+	agent            *relayAgentSession
+	client           net.Conn
+	bufrw            *bufio.ReadWriter
+	protocol         streamProtocol
+	targetHost       string
+	targetPort       int
+	metaMu           sync.RWMutex
+	resolvedTarget   string
+	resolutionSource string
+	principalType    string
+	principalName    string
+	groupID          string
+	groupName        string
+	profileID        string
+	profileName      string
+	routeReasonCode  string
+	routeReason      string
+	createdAt        time.Time
+	once             sync.Once
+	closing          chan struct{}
+	readyCh          chan error
+	readyOnce        sync.Once
+	handshake        chan struct{}
+	bytesUp          atomic.Int64
+	bytesDown        atomic.Int64
+	spanID           string
 
 	writeQueue         chan relayWriteRequest
 	writerOnce         sync.Once
@@ -102,7 +113,7 @@ type relayStream struct {
 	windowBatch        int
 }
 
-func newRelayStream(id string, agent *relayAgentSession, proto streamProtocol, client net.Conn, bufrw *bufio.ReadWriter, host string, port int, queueDepth int, windowUpdate func(int) error) *relayStream {
+func newRelayStream(id uint64, agent *relayAgentSession, proto streamProtocol, client net.Conn, bufrw *bufio.ReadWriter, host string, port int, queueDepth int, windowUpdate func(int) error) *relayStream {
 	spanID := logctx.NewSpanID()
 	streamLogger := agent.logger
 	if streamLogger == nil {
@@ -412,16 +423,18 @@ func (s *relayStream) shutdown(notifyAgent bool, err error) {
 		s.agent.removeStream(s.id)
 		_ = s.client.Close()
 		if notifyAgent {
-			frameType := protocol.FrameTypeClose
 			frameErr := ""
 			if err != nil && err.Error() != "" {
-				frameType = protocol.FrameTypeError
 				frameErr = err.Error()
 			}
-			_ = s.agent.send(&protocol.Frame{
-				Type:     frameType,
+			code := protocol.CloseCodeOK
+			if err != nil {
+				code = protocol.CloseCodeRemoteError
+			}
+			_ = s.agent.sendClose(protocol.ClosePacket{
 				StreamID: s.id,
-				Error:    frameErr,
+				Code:     code,
+				Message:  frameErr,
 			})
 		}
 	})
@@ -431,7 +444,57 @@ func (s *relayStream) target() string {
 	return net.JoinHostPort(s.targetHost, strconv.Itoa(s.targetPort))
 }
 
+func (s *relayStream) setResolvedTarget(target, source string) {
+	s.metaMu.Lock()
+	s.resolvedTarget = target
+	s.resolutionSource = source
+	s.metaMu.Unlock()
+}
+
+func (s *relayStream) setRouting(decision routeDecision) {
+	s.metaMu.Lock()
+	s.principalType = decision.PrincipalType
+	s.principalName = decision.PrincipalName
+	s.groupID = decision.GroupID
+	s.groupName = decision.GroupName
+	s.profileID = decision.ProfileID
+	s.profileName = decision.ProfileName
+	s.routeReasonCode = decision.ReasonCode
+	s.routeReason = decision.Reason
+	s.metaMu.Unlock()
+}
+
+type relayStreamQuotaMeta struct {
+	PrincipalType string
+	PrincipalName string
+	GroupID       string
+	GroupName     string
+}
+
+func (s *relayStream) quotaMeta() relayStreamQuotaMeta {
+	s.metaMu.RLock()
+	defer s.metaMu.RUnlock()
+	return relayStreamQuotaMeta{
+		PrincipalType: s.principalType,
+		PrincipalName: s.principalName,
+		GroupID:       s.groupID,
+		GroupName:     s.groupName,
+	}
+}
+
 func (s *relayStream) stats() statusStream {
+	s.metaMu.RLock()
+	resolvedTarget := s.resolvedTarget
+	resolutionSource := s.resolutionSource
+	principalType := s.principalType
+	principalName := s.principalName
+	groupID := s.groupID
+	groupName := s.groupName
+	profileID := s.profileID
+	profileName := s.profileName
+	routeReasonCode := s.routeReasonCode
+	routeReason := s.routeReason
+	s.metaMu.RUnlock()
 	pendingBytes := s.pendingClientBytes.Load()
 	pendingChunks := 0
 	if s.writeQueue != nil {
@@ -442,8 +505,18 @@ func (s *relayStream) stats() statusStream {
 		backlogLimit = s.backlogLimit.Capacity()
 	}
 	return statusStream{
-		StreamID:            s.id,
+		StreamID:            formatStreamID(s.id),
 		Target:              s.target(),
+		ResolvedTarget:      resolvedTarget,
+		ResolutionSource:    resolutionSource,
+		PrincipalType:       principalType,
+		PrincipalName:       principalName,
+		GroupID:             groupID,
+		GroupName:           groupName,
+		ProfileID:           profileID,
+		ProfileName:         profileName,
+		RouteReasonCode:     routeReasonCode,
+		RouteReason:         routeReason,
 		Protocol:            s.protocol.String(),
 		CreatedAt:           s.createdAt,
 		BytesUp:             s.bytesUp.Load(),

@@ -2,11 +2,10 @@ package agent
 
 import (
 	"net/url"
-	"runtime"
 	"testing"
 )
 
-func TestShouldUpdateVersion(t *testing.T) {
+func TestShouldSyncVersion(t *testing.T) {
 	tests := []struct {
 		name    string
 		current string
@@ -35,7 +34,7 @@ func TestShouldUpdateVersion(t *testing.T) {
 			name:    "older target skipped",
 			current: "0.2.0+build.1.aaaa",
 			target:  "0.1.9+build.99.zzzz",
-			want:    false,
+			want:    true,
 		},
 		{
 			name:    "unparseable target different still updates",
@@ -47,9 +46,9 @@ func TestShouldUpdateVersion(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := shouldUpdateVersion(tt.current, tt.target)
+			got := shouldSyncVersion(tt.current, tt.target)
 			if got != tt.want {
-				t.Fatalf("shouldUpdateVersion(%q, %q) = %v, want %v", tt.current, tt.target, got, tt.want)
+				t.Fatalf("shouldSyncVersion(%q, %q) = %v, want %v", tt.current, tt.target, got, tt.want)
 			}
 		})
 	}
@@ -74,7 +73,7 @@ func TestDeriveDefaultUpdateManifestURL(t *testing.T) {
 		t.Fatalf("parse relay url: %v", err)
 	}
 	got := deriveDefaultUpdateManifestURL(relayURL)
-	want := "https://relay.example.com/updates/manifest-" + runtime.GOOS + "-" + runtime.GOARCH + ".json"
+	want := "https://relay.example.com/updates/agent/manifest"
 	if got == "" {
 		t.Fatal("expected non-empty update manifest url")
 	}

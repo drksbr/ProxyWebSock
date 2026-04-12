@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/drksbr/ProxyWebSock/internal/logger"
+	"github.com/drksbr/ProxyWebSock/internal/util"
 	"github.com/drksbr/ProxyWebSock/internal/util/bytelimiter"
 )
 
@@ -24,7 +25,7 @@ type streamWriteRequest struct {
 }
 
 type agentStream struct {
-	id           string
+	id           uint64
 	conn         net.Conn
 	sendWindow   *bytelimiter.ByteLimiter
 	inboundLimit *bytelimiter.ByteLimiter
@@ -64,7 +65,7 @@ func releaseAgentBuffer(buf []byte) {
 	}
 }
 
-func newAgentStream(id string, conn net.Conn, maxInFlight, queueDepth int, baseLogger *slog.Logger, windowUpdate func(int) error) *agentStream {
+func newAgentStream(id uint64, conn net.Conn, maxInFlight, queueDepth int, baseLogger *slog.Logger, windowUpdate func(int) error) *agentStream {
 	spanID := logger.NewSpanID()
 	streamLogger := baseLogger
 	if streamLogger != nil {
@@ -187,7 +188,7 @@ func (s *agentStream) writerLoop() {
 		for total < len(req.data) {
 			n, err := s.conn.Write(req.data[total:])
 			if err != nil {
-				if s.logger != nil {
+				if s.logger != nil && !util.IsExpectedNetClose(err) && !s.isClosed() {
 					s.logger.Warn("stream write failed", "error", err)
 				}
 				writeErr = err

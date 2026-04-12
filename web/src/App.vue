@@ -10,7 +10,14 @@ import {
 
 import AppHeader from "./components/AppHeader.vue";
 import AgentsSection from "./components/agents/AgentsSection.vue";
+import AuditSection from "./components/audit/AuditSection.vue";
+import AccessControlSection from "./components/controlplane/AccessControlSection.vue";
+import ControlPlaneSection from "./components/controlplane/ControlPlaneSection.vue";
+import DiagnosticsSection from "./components/diagnostics/DiagnosticsSection.vue";
+import DNSOverridesSection from "./components/dns/DNSOverridesSection.vue";
 import ResourcesSection from "./components/resources/ResourcesSection.vue";
+import RoutingSection from "./components/routing/RoutingSection.vue";
+import SupportSection from "./components/support/SupportSection.vue";
 import SummarySection from "./components/summary/SummarySection.vue";
 import { FRONTEND_VERSION } from "./version";
 import type {
@@ -19,6 +26,13 @@ import type {
   NetworkRates,
   ResourcePoint,
   StatusAgent,
+  StatusAgentGroup,
+  StatusAuditEvent,
+  StatusDiagnosticEvent,
+  StatusDestinationProfile,
+  StatusRouteEvent,
+  StatusSupportSnapshot,
+  StatusUpdateCatalogEntry,
   StatusPayload,
 } from "./types/status";
 import {
@@ -57,13 +71,39 @@ const emptyPoint: ResourcePoint = {
   goroutines: 0,
 };
 
+const emptySupport: StatusSupportSnapshot = {
+  totalFailures: 0,
+  routeFailures: 0,
+  diagnosticFailures: 0,
+  activeBreakers: [],
+  quotas: {
+    userStreamLimit: 0,
+    groupStreamLimit: 0,
+    agentStreamLimit: 0,
+    users: [],
+    groups: [],
+    agents: [],
+  },
+  topDestinations: [],
+  topPrincipals: [],
+  topAgents: [],
+};
+
 const emptyStatus: StatusPayload = {
   generatedAt: "",
   proxyAddr: "",
   secureAddr: "",
   socksAddr: "",
   acmeHosts: [],
+  dnsOverrides: [],
+  agentGroups: [],
+  destinationProfiles: [],
+  support: emptySupport,
+  auditEvents: [],
+  routeEvents: [],
+  diagnosticEvents: [],
   downloads: [],
+  updateCatalog: [],
   agents: [],
   metrics: {
     agentsConnected: 0,
@@ -72,6 +112,8 @@ const emptyStatus: StatusPayload = {
     bytesDown: 0,
     dialErrors: 0,
     authFailures: 0,
+    routeDecisions: 0,
+    routeFailures: 0,
   },
   resources: {
     current: { ...emptyPoint },
@@ -92,6 +134,8 @@ const netRates = reactive<NetworkRates>({ in: 0, out: 0 });
 const lastMetrics = ref<MetricsSnapshot | null>(null);
 const netHistory = ref<NetworkPoint[]>([]);
 const refreshIntervalMs = ref<number>(3000);
+const supportSearchQuery = ref("");
+const supportFailuresOnly = ref(false);
 const frontendVersion = FRONTEND_VERSION;
 let pollTimer: number | null = null;
 
@@ -113,6 +157,8 @@ const summaryCards = computed(() => {
     { label: "Memória RSS", value: formatBytes(resources.rssBytes) },
     { label: "Rede In", value: formatRate(netRates.in) },
     { label: "Rede Out", value: formatRate(netRates.out) },
+    { label: "Rotas Selecionadas", value: formatCount(metrics.routeDecisions) },
+    { label: "Falhas de Rota", value: formatCount(metrics.routeFailures) },
     {
       label: "Bytes (cliente → intranet)",
       value: formatBytes(metrics.bytesUp),
@@ -181,6 +227,13 @@ function normalizePayload(payload?: StatusPayload): StatusPayload {
       },
       agents: [],
       acmeHosts: [],
+      dnsOverrides: [],
+      agentGroups: [],
+      destinationProfiles: [],
+      support: { ...emptySupport },
+      auditEvents: [],
+      routeEvents: [],
+      diagnosticEvents: [],
     };
   }
   const normalizedAgents: StatusAgent[] = (payload.agents ?? []).map(
@@ -216,12 +269,186 @@ function normalizePayload(payload?: StatusPayload): StatusPayload {
         agentCpuPercent: agent.agentCpuPercent ?? undefined,
         agentRssBytes: agent.agentRssBytes ?? 0,
         agentGoroutines: agent.agentGoroutines ?? 0,
+        goos: agent.goos ?? "",
+        goarch: agent.goarch ?? "",
+        currentVersion: agent.currentVersion ?? "",
+        desiredVersion: agent.desiredVersion ?? "",
+        pinnedVersion: agent.pinnedVersion ?? "",
+        updateTrack: agent.updateTrack ?? "latest",
+        lastUpdateCheckAt: agent.lastUpdateCheckAt ?? "",
         acl: agent.acl ?? [],
         streams: agent.streams ?? [],
         autoConfig: agent.autoConfig ?? "",
       };
     },
   );
+  const normalizedGroups: StatusAgentGroup[] = (payload.agentGroups ?? []).map(
+    (group) => ({
+      id: group.id ?? "",
+      name: group.name ?? "",
+      slug: group.slug ?? "",
+      description: group.description ?? "",
+      routingMode: group.routingMode ?? "health-first",
+      memberCount: group.memberCount ?? 0,
+      enabledMemberCount: group.enabledMemberCount ?? 0,
+      legacy: group.legacy ?? false,
+      createdAt: group.createdAt ?? "",
+      updatedAt: group.updatedAt ?? "",
+    }),
+  );
+  const normalizedProfiles: StatusDestinationProfile[] = (
+    payload.destinationProfiles ?? []
+  ).map((profile) => ({
+    id: profile.id ?? "",
+    name: profile.name ?? "",
+    slug: profile.slug ?? "",
+    host: profile.host ?? "",
+    port: profile.port ?? 0,
+    protocolHint: profile.protocolHint ?? "",
+    defaultGroupId: profile.defaultGroupId ?? "",
+    defaultGroupName: profile.defaultGroupName ?? "",
+    notes: profile.notes ?? "",
+    createdAt: profile.createdAt ?? "",
+    updatedAt: profile.updatedAt ?? "",
+  }));
+  const normalizedSupport: StatusSupportSnapshot = {
+    totalFailures: payload.support?.totalFailures ?? 0,
+    routeFailures: payload.support?.routeFailures ?? 0,
+    diagnosticFailures: payload.support?.diagnosticFailures ?? 0,
+    activeBreakers: (payload.support?.activeBreakers ?? []).map((breaker) => ({
+      groupId: breaker.groupId ?? "",
+      groupName: breaker.groupName ?? "",
+      target: breaker.target ?? "",
+      state: breaker.state ?? "",
+      consecutiveFailures: breaker.consecutiveFailures ?? 0,
+      lastError: breaker.lastError ?? "",
+      lastFailureAt: breaker.lastFailureAt ?? "",
+      openUntil: breaker.openUntil ?? "",
+      probeInFlight: breaker.probeInFlight ?? false,
+    })),
+    quotas: {
+      userStreamLimit: payload.support?.quotas?.userStreamLimit ?? 0,
+      groupStreamLimit: payload.support?.quotas?.groupStreamLimit ?? 0,
+      agentStreamLimit: payload.support?.quotas?.agentStreamLimit ?? 0,
+      users: (payload.support?.quotas?.users ?? []).map((counter) => ({
+        key: counter.key ?? "",
+        label: counter.label ?? "",
+        count: counter.count ?? 0,
+        limit: counter.limit ?? 0,
+        saturated: counter.saturated ?? false,
+      })),
+      groups: (payload.support?.quotas?.groups ?? []).map((counter) => ({
+        key: counter.key ?? "",
+        label: counter.label ?? "",
+        count: counter.count ?? 0,
+        limit: counter.limit ?? 0,
+        saturated: counter.saturated ?? false,
+      })),
+      agents: (payload.support?.quotas?.agents ?? []).map((counter) => ({
+        key: counter.key ?? "",
+        label: counter.label ?? "",
+        count: counter.count ?? 0,
+        limit: counter.limit ?? 0,
+        saturated: counter.saturated ?? false,
+      })),
+    },
+    topDestinations: (payload.support?.topDestinations ?? []).map((bucket) => ({
+      key: bucket.key ?? "",
+      label: bucket.label ?? "",
+      count: bucket.count ?? 0,
+      lastSeen: bucket.lastSeen ?? "",
+      sources: bucket.sources ?? [],
+    })),
+    topPrincipals: (payload.support?.topPrincipals ?? []).map((bucket) => ({
+      key: bucket.key ?? "",
+      label: bucket.label ?? "",
+      count: bucket.count ?? 0,
+      lastSeen: bucket.lastSeen ?? "",
+      sources: bucket.sources ?? [],
+    })),
+    topAgents: (payload.support?.topAgents ?? []).map((bucket) => ({
+      key: bucket.key ?? "",
+      label: bucket.label ?? "",
+      count: bucket.count ?? 0,
+      lastSeen: bucket.lastSeen ?? "",
+      sources: bucket.sources ?? [],
+    })),
+  };
+  const normalizedAuditEvents: StatusAuditEvent[] = (
+    payload.auditEvents ?? []
+  ).map((event) => ({
+    id: event.id ?? "",
+    timestamp: event.timestamp ?? "",
+    category: event.category ?? "",
+    action: event.action ?? "",
+    actorType: event.actorType ?? "",
+    actorId: event.actorId ?? "",
+    actorName: event.actorName ?? "",
+    resourceType: event.resourceType ?? "",
+    resourceId: event.resourceId ?? "",
+    resourceName: event.resourceName ?? "",
+    outcome: event.outcome ?? "",
+    message: event.message ?? "",
+    remoteAddr: event.remoteAddr ?? "",
+    metadata: event.metadata ?? {},
+  }));
+  const normalizedRouteEvents: StatusRouteEvent[] = (
+    payload.routeEvents ?? []
+  ).map((event) => ({
+    timestamp: event.timestamp ?? "",
+    protocol: event.protocol ?? "",
+    outcome: event.outcome ?? "",
+    reasonCode: event.reasonCode ?? "",
+    message: event.message ?? "",
+    target: event.target ?? "",
+    principalType: event.principalType ?? "",
+    principalName: event.principalName ?? "",
+    groupId: event.groupId ?? "",
+    groupName: event.groupName ?? "",
+    profileId: event.profileId ?? "",
+    profileName: event.profileName ?? "",
+    agentId: event.agentId ?? "",
+    agentName: event.agentName ?? "",
+    candidateCount: event.candidateCount ?? 0,
+    selectedStatus: event.selectedStatus ?? "",
+  }));
+  const normalizedDiagnosticEvents: StatusDiagnosticEvent[] = (
+    payload.diagnosticEvents ?? []
+  ).map((event) => ({
+    timestamp: event.timestamp ?? "",
+    mode: event.mode ?? "",
+    outcome: event.outcome ?? "",
+    host: event.host ?? "",
+    port: event.port ?? 0,
+    target: event.target ?? "",
+    agentId: event.agentId ?? "",
+    agentName: event.agentName ?? "",
+    groupId: event.groupId ?? "",
+    groupName: event.groupName ?? "",
+    profileId: event.profileId ?? "",
+    profileName: event.profileName ?? "",
+    overrideAddress: event.overrideAddress ?? "",
+    reasonCode: event.reasonCode ?? "",
+    message: event.message ?? "",
+    selectedStatus: event.selectedStatus ?? "",
+    candidateCount: event.candidateCount ?? 0,
+    startedAt: event.startedAt ?? "",
+    finishedAt: event.finishedAt ?? "",
+    durationMillis: event.durationMillis ?? 0,
+    steps: (event.steps ?? []).map((step) => ({
+      step: step.step ?? "",
+      success: step.success ?? false,
+      durationMillis: step.durationMillis ?? 0,
+      message: step.message ?? "",
+      resolutionSource: step.resolutionSource ?? "",
+      addresses: step.addresses ?? [],
+      selectedAddress: step.selectedAddress ?? "",
+      tlsServerName: step.tlsServerName ?? "",
+      tlsVersion: step.tlsVersion ?? "",
+      tlsCipherSuite: step.tlsCipherSuite ?? "",
+      tlsPeerNames: step.tlsPeerNames ?? [],
+    })),
+  }));
 
   return {
     generatedAt: payload.generatedAt ?? "",
@@ -229,7 +456,15 @@ function normalizePayload(payload?: StatusPayload): StatusPayload {
     secureAddr: payload.secureAddr ?? "",
     socksAddr: payload.socksAddr ?? "",
     acmeHosts: payload.acmeHosts ?? [],
+    dnsOverrides: payload.dnsOverrides ?? [],
+    agentGroups: normalizedGroups,
+    destinationProfiles: normalizedProfiles,
+    support: normalizedSupport,
+    auditEvents: normalizedAuditEvents,
+    routeEvents: normalizedRouteEvents,
+    diagnosticEvents: normalizedDiagnosticEvents,
     downloads: payload.downloads ?? [],
+    updateCatalog: (payload.updateCatalog ?? []) as StatusUpdateCatalogEntry[],
     agents: normalizedAgents,
     metrics: {
       agentsConnected: payload.metrics?.agentsConnected ?? 0,
@@ -238,6 +473,8 @@ function normalizePayload(payload?: StatusPayload): StatusPayload {
       bytesDown: payload.metrics?.bytesDown ?? 0,
       dialErrors: payload.metrics?.dialErrors ?? 0,
       authFailures: payload.metrics?.authFailures ?? 0,
+      routeDecisions: payload.metrics?.routeDecisions ?? 0,
+      routeFailures: payload.metrics?.routeFailures ?? 0,
     },
     resources: {
       current: {
@@ -335,6 +572,21 @@ function handleRefreshInterval(ms: number) {
 function handleRangeUpdate(minutes: number) {
   rangeMinutes.value = minutes;
 }
+
+async function reloadStatusNow() {
+  try {
+    const res = await fetch("/status.json", {
+      cache: "no-store",
+    });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const payload = (await res.json()) as StatusPayload;
+    data.value = normalizePayload(payload);
+  } catch (err) {
+    console.warn("status reload failed", err);
+  }
+}
 </script>
 
 <template>
@@ -357,7 +609,58 @@ function handleRangeUpdate(minutes: number) {
       <ResourcesSection :resources="data.resources" :range-options="RANGE_OPTIONS" :selected-range="rangeMinutes"
         :net-history="netHistory" @update:range="handleRangeUpdate" />
 
-      <AgentsSection :agents="data.agents" />
+      <SupportSection
+        :support="data.support ?? emptySupport"
+        :search-query="supportSearchQuery"
+        :failures-only="supportFailuresOnly"
+        @update:search-query="supportSearchQuery = $event"
+        @update:failures-only="supportFailuresOnly = $event"
+      />
+
+      <DiagnosticsSection
+        :agents="data.agents"
+        :agent-groups="data.agentGroups ?? []"
+        :destination-profiles="data.destinationProfiles ?? []"
+        :diagnostic-events="data.diagnosticEvents ?? []"
+        :search-query="supportSearchQuery"
+        :failures-only="supportFailuresOnly"
+      />
+
+      <AuditSection
+        :audit-events="data.auditEvents ?? []"
+        :search-query="supportSearchQuery"
+        :failures-only="supportFailuresOnly"
+      />
+
+      <RoutingSection
+        :route-events="data.routeEvents ?? []"
+        :search-query="supportSearchQuery"
+        :failures-only="supportFailuresOnly"
+      />
+
+      <DNSOverridesSection
+        :overrides="data.dnsOverrides ?? []"
+        @refresh-requested="reloadStatusNow"
+      />
+
+      <ControlPlaneSection
+        :agent-groups="data.agentGroups ?? []"
+        :destination-profiles="data.destinationProfiles ?? []"
+        @refresh-requested="reloadStatusNow"
+      />
+
+      <AccessControlSection
+        :agent-groups="data.agentGroups ?? []"
+        :destination-profiles="data.destinationProfiles ?? []"
+        :agents="data.agents"
+        @refresh-requested="reloadStatusNow"
+      />
+
+      <AgentsSection
+        :agents="data.agents"
+        :update-catalog="data.updateCatalog ?? []"
+        @refresh-requested="reloadStatusNow"
+      />
     </div>
   </div>
 </template>

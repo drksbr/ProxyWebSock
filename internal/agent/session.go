@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,15 +18,17 @@ import (
 	"github.com/drksbr/ProxyWebSock/internal/logger"
 	"github.com/drksbr/ProxyWebSock/internal/protocol"
 	"github.com/drksbr/ProxyWebSock/internal/util"
+	"github.com/drksbr/ProxyWebSock/internal/version"
 )
 
 var errWriterClosed = errors.New("writer closed")
 
 type outboundMessage struct {
-	frame          *protocol.Frame
-	binaryStreamID string
-	binaryPayload  []byte
-	onWrite        func(success bool)
+	packet          []byte
+	heartbeat       *protocol.HeartbeatPayload
+	binaryStreamID  uint64
+	binaryPayload   []byte
+	onWriteComplete func(success bool)
 }
 
 const resourceSampleInterval = 10 * time.Second
@@ -36,7 +37,7 @@ type session struct {
 	agent *agent
 	conn  *websocket.Conn
 
-	streams   map[string]*agentStream
+	streams   map[uint64]*agentStream
 	streamsMu sync.RWMutex
 	logger    *slog.Logger
 	traceID   string
@@ -56,7 +57,7 @@ func newSession(agent *agent, conn *websocket.Conn) *session {
 	return &session{
 		agent:        agent,
 		conn:         conn,
-		streams:      make(map[string]*agentStream),
+		streams:      make(map[uint64]*agentStream),
 		logger:       agent.logger.With("session", time.Now().UnixNano(), "trace_id", traceID),
 		traceID:      traceID,
 		heartbeat:    newHeartbeatState(),
@@ -103,14 +104,14 @@ func (s *session) writerLoop() {
 					continue
 				}
 				if err := s.writeMessage(&msg); err != nil {
-					if msg.onWrite != nil {
-						msg.onWrite(false)
+					if msg.onWriteComplete != nil {
+						msg.onWriteComplete(false)
 					}
 					s.logger.Warn("writer failed", "error", err)
 					return
 				}
-				if msg.onWrite != nil {
-					msg.onWrite(true)
+				if msg.onWriteComplete != nil {
+					msg.onWriteComplete(true)
 				}
 				continue
 			default:
@@ -143,14 +144,14 @@ func (s *session) writerLoop() {
 			}
 		}
 		if err := s.writeMessage(&msg); err != nil {
-			if msg.onWrite != nil {
-				msg.onWrite(false)
+			if msg.onWriteComplete != nil {
+				msg.onWriteComplete(false)
 			}
 			s.logger.Warn("writer failed", "error", err)
 			return
 		}
-		if msg.onWrite != nil {
-			msg.onWrite(true)
+		if msg.onWriteComplete != nil {
+			msg.onWriteComplete(true)
 		}
 	}
 }
@@ -159,37 +160,34 @@ func (s *session) writeMessage(msg *outboundMessage) error {
 	if msg == nil {
 		return nil
 	}
-	if msg.frame != nil {
-		frame := msg.frame
-		if err := s.conn.SetWriteDeadline(time.Now().Add(20 * time.Second)); err != nil {
+	if msg.heartbeat != nil {
+		payload := msg.heartbeat
+		var sendTime time.Time
+		if payload.Mode == protocol.HeartbeatModePing && payload.SentAt == 0 {
+			sendTime = time.Now()
+			payload.SentAt = sendTime.UnixNano()
+		}
+		packet, err := protocol.EncodeHeartbeatPacket(payload)
+		if err != nil {
 			return err
 		}
-		var sendTime time.Time
-		if frame.Type == protocol.FrameTypeHeartbeat && frame.Heartbeat != nil {
-			if frame.Heartbeat.Mode == protocol.HeartbeatModePing && frame.Heartbeat.SentAt == 0 {
-				sendTime = time.Now()
-				frame.Heartbeat.SentAt = sendTime.UnixNano()
-			}
-		}
-		writeErr := s.conn.WriteJSON(frame)
-		if frame.Type == protocol.FrameTypeHeartbeat && frame.Heartbeat != nil && frame.Heartbeat.Mode == protocol.HeartbeatModePing {
-			if writeErr == nil {
-				if sendTime.IsZero() {
-					sendTime = time.Unix(0, frame.Heartbeat.SentAt)
-				}
-				s.heartbeat.markSent(frame.Heartbeat.Sequence, sendTime)
-				s.heartbeat.expirePending(sendTime)
-			} else {
+		if err := s.writePacket(packet); err != nil {
+			if payload.Mode == protocol.HeartbeatModePing {
 				s.heartbeat.markSendFailure()
 			}
+			return err
 		}
-		if writeErr != nil {
-			return writeErr
-		}
-		if err := s.conn.SetWriteDeadline(time.Time{}); err != nil {
-			s.logger.Debug("reset write deadline failed", "error", err)
+		if payload.Mode == protocol.HeartbeatModePing {
+			if sendTime.IsZero() {
+				sendTime = time.Unix(0, payload.SentAt)
+			}
+			s.heartbeat.markSent(payload.Sequence, sendTime)
+			s.heartbeat.expirePending(sendTime)
 		}
 		return nil
+	}
+	if len(msg.packet) > 0 {
+		return s.writePacket(msg.packet)
 	}
 	if len(msg.binaryPayload) > 0 {
 		if err := s.conn.SetWriteDeadline(time.Now().Add(20 * time.Second)); err != nil {
@@ -199,7 +197,7 @@ func (s *session) writeMessage(msg *outboundMessage) error {
 		if err != nil {
 			return err
 		}
-		writeErr := protocol.WriteBinaryFrame(writer, msg.binaryStreamID, msg.binaryPayload)
+		writeErr := protocol.WriteDataPacket(writer, msg.binaryStreamID, msg.binaryPayload)
 		closeErr := writer.Close()
 		if writeErr == nil {
 			writeErr = closeErr
@@ -211,6 +209,22 @@ func (s *session) writeMessage(msg *outboundMessage) error {
 			s.logger.Debug("reset write deadline failed", "error", err)
 		}
 		return nil
+	}
+	return nil
+}
+
+func (s *session) writePacket(packet []byte) error {
+	if len(packet) == 0 {
+		return nil
+	}
+	if err := s.conn.SetWriteDeadline(time.Now().Add(20 * time.Second)); err != nil {
+		return err
+	}
+	if err := s.conn.WriteMessage(websocket.BinaryMessage, packet); err != nil {
+		return err
+	}
+	if err := s.conn.SetWriteDeadline(time.Time{}); err != nil {
+		s.logger.Debug("reset write deadline failed", "error", err)
 	}
 	return nil
 }
@@ -240,7 +254,7 @@ func (s *session) run(ctx context.Context) error {
 	ctx = logger.ContextWithTrace(ctx, s.traceID)
 	defer s.conn.Close()
 
-	readLimit := int64(s.agent.opts.maxFrame + 1024)
+	readLimit := int64(s.agent.opts.maxFrame + 64*1024)
 	if readLimit < 1<<20 {
 		readLimit = 1 << 20
 	}
@@ -273,18 +287,18 @@ func (s *session) run(ctx context.Context) error {
 }
 
 func (s *session) register() error {
-	if err := s.conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		return err
-	}
-	if err := s.conn.WriteJSON(&protocol.Frame{
-		Type:    protocol.FrameTypeRegister,
+	packet, err := protocol.EncodeRegisterPacket(protocol.RegisterRequest{
 		AgentID: s.agent.opts.agentID,
 		Token:   s.agent.opts.token,
-	}); err != nil {
-		return fmt.Errorf("send register: %w", err)
+		Version: version.Version,
+		GOOS:    runtime.GOOS,
+		GOARCH:  runtime.GOARCH,
+	})
+	if err != nil {
+		return fmt.Errorf("encode register: %w", err)
 	}
-	if err := s.conn.SetWriteDeadline(time.Time{}); err != nil {
-		return err
+	if err := s.writePacket(packet); err != nil {
+		return fmt.Errorf("send register: %w", err)
 	}
 	readDeadline := heartbeatTimeout
 	if err := s.conn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
@@ -308,146 +322,148 @@ func (s *session) readLoop() error {
 		if err := s.conn.SetReadDeadline(time.Now().Add(heartbeatTimeout)); err != nil {
 			return err
 		}
-
-		switch messageType {
-		case websocket.BinaryMessage:
-			streamID, payload, release, err := protocol.ReadBinaryFramePooled(r, s.agent.opts.maxFrame+1024)
+		if messageType != websocket.BinaryMessage {
+			continue
+		}
+		header, body, release, err := protocol.ReadPacketPooled(r, s.agent.opts.maxFrame+64*1024)
+		if err != nil {
+			return err
+		}
+		switch header.Type {
+		case protocol.PacketTypeDialRequest:
+			req, err := protocol.DecodeDialRequestPacket(header, body)
+			release()
 			if err != nil {
 				return err
 			}
-			s.handleBinaryWrite(streamID, payload, release)
-		case websocket.TextMessage:
-			var f protocol.Frame
-			if err := json.NewDecoder(r).Decode(&f); err != nil {
+			go s.handleDial(req)
+		case protocol.PacketTypeDiagnosticRequest:
+			req, err := protocol.DecodeDiagnosticRequestPacket(header, body)
+			release()
+			if err != nil {
 				return err
 			}
-
-			switch f.Type {
-			case protocol.FrameTypeDial:
-				go s.handleDial(f)
-			case protocol.FrameTypeWrite:
-				s.handleWrite(f)
-			case protocol.FrameTypeWindow:
-				s.handleWindow(f)
-			case protocol.FrameTypeClose:
-				s.handleClose(f)
-			case protocol.FrameTypeError:
-				s.handleRelayError(f)
-			case protocol.FrameTypeHeartbeat:
-				s.handleHeartbeat(f)
-			default:
-				s.logger.Warn("unknown frame type", "type", f.Type)
+			go s.handleDiagnostic(req)
+		case protocol.PacketTypeData:
+			streamID := header.StreamID
+			s.handleBinaryWrite(streamID, body, release)
+		case protocol.PacketTypeWindowUpdate:
+			update, err := protocol.DecodeWindowUpdatePacket(header, body)
+			release()
+			if err != nil {
+				return err
 			}
+			s.handleWindow(update)
+		case protocol.PacketTypeClose:
+			closePacket, err := protocol.DecodeClosePacket(header, body)
+			release()
+			if err != nil {
+				return err
+			}
+			s.handleClose(closePacket)
+		case protocol.PacketTypeHeartbeat:
+			payload, err := protocol.DecodeHeartbeatPacket(header, body)
+			release()
+			if err != nil {
+				return err
+			}
+			s.handleHeartbeat(payload)
+		case protocol.PacketTypeUpdate:
+			release()
+			go s.agent.checkForUpdate(context.Background())
 		default:
-			// ignore other message types
+			release()
+			s.logger.Warn("unknown packet type", "type", header.Type)
 		}
 	}
 }
 
-func (s *session) handleDial(f protocol.Frame) {
-	if f.StreamID == "" {
-		s.logger.Warn("dial missing streamId")
+func (s *session) handleDiagnostic(req protocol.DiagnosticRequest) {
+	resp := s.agent.runDiagnostic(req)
+	if err := s.sendDiagnosticResponse(resp); err != nil {
+		s.logger.Warn("send diagnostic response failed", "request", req.RequestID, "error", err)
+	}
+}
+
+func (s *session) handleDial(req protocol.DialRequest) {
+	if req.StreamID == 0 {
+		s.logger.Warn("dial missing stream id")
 		return
 	}
-	address := net.JoinHostPort(f.Host, fmt.Sprintf("%d", f.Port))
 
 	timeout := time.Duration(s.agent.opts.dialTimeoutMs) * time.Millisecond
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
 
-	conn, err := net.DialTimeout("tcp", address, timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	conn, dialAddress, resolutionSource, err := s.agent.dialTarget(ctx, req.Host, req.Port, req.OverrideAddress)
 	if err != nil {
-		s.logger.Warn("dial failed", "stream", f.StreamID, "target", address, "error", err)
+		s.logger.Warn("dial failed", "stream", req.StreamID, "target", net.JoinHostPort(req.Host, fmt.Sprintf("%d", req.Port)), "error", err)
 		s.heartbeat.recordError(err.Error())
-		_ = s.sendFrame(&protocol.Frame{
-			Type:     protocol.FrameTypeError,
-			StreamID: f.StreamID,
+		_ = s.sendDialResponse(protocol.DialResponse{
+			StreamID: req.StreamID,
 			Error:    err.Error(),
 		})
 		return
 	}
 	util.TuneTCPConn(conn, s.agent.opts.readBuffer, s.agent.opts.writeBuffer)
 
-	stream := newAgentStream(f.StreamID, conn, s.agent.opts.maxInFlight, s.agent.opts.queueDepth, s.logger, func(delta int) error {
-		return s.sendWindowUpdate(f.StreamID, delta)
+	stream := newAgentStream(req.StreamID, conn, s.agent.opts.maxInFlight, s.agent.opts.queueDepth, s.logger, func(delta int) error {
+		return s.sendWindowUpdate(req.StreamID, delta)
 	})
 	if err := s.storeStream(stream); err != nil {
-		s.logger.Warn("stream register failed", "stream", f.StreamID, "error", err)
 		conn.Close()
 		s.heartbeat.recordError(err.Error())
-		_ = s.sendFrame(&protocol.Frame{
-			Type:     protocol.FrameTypeError,
-			StreamID: f.StreamID,
+		_ = s.sendDialResponse(protocol.DialResponse{
+			StreamID: req.StreamID,
 			Error:    err.Error(),
 		})
 		return
 	}
 
-	if err := s.sendFrame(&protocol.Frame{
-		Type:     protocol.FrameTypeDial,
-		StreamID: f.StreamID,
+	if err := s.sendDialResponse(protocol.DialResponse{
+		StreamID:         req.StreamID,
+		DialAddress:      dialAddress,
+		ResolutionSource: resolutionSource,
 	}); err != nil {
-		s.logger.Warn("send dial ack failed", "stream", f.StreamID, "error", err)
+		s.logger.Warn("send dial response failed", "stream", req.StreamID, "error", err)
 		stream.close()
+		s.removeStream(req.StreamID)
 		return
 	}
 
 	go s.pipeOutbound(stream)
 }
 
-func (s *session) handleWrite(f protocol.Frame) {
-	stream := s.getStream(f.StreamID)
-	if stream == nil {
-		s.logger.Warn("write for unknown stream", "stream", f.StreamID)
-		return
-	}
-	payload, err := protocol.DecodePayload(f.Payload)
-	if err != nil {
-		s.logger.Warn("payload decode failed", "stream", f.StreamID, "error", err)
-		return
-	}
-	s.handleBinaryWriteWithStream(stream, payload, nil)
-}
-
-func (s *session) handleClose(f protocol.Frame) {
-	stream := s.removeStream(f.StreamID)
+func (s *session) handleClose(closePacket protocol.ClosePacket) {
+	stream := s.removeStream(closePacket.StreamID)
 	if stream == nil {
 		return
 	}
 	stream.close()
-	if f.Error != "" {
-		s.logger.Info("stream closed by relay", "stream", f.StreamID, "error", f.Error)
+	if closePacket.Message != "" {
+		s.logger.Info("stream closed by relay", "stream", closePacket.StreamID, "code", closePacket.Code, "error", closePacket.Message)
 	}
 }
 
-func (s *session) handleRelayError(f protocol.Frame) {
-	stream := s.removeStream(f.StreamID)
-	if stream != nil {
-		stream.close()
-	}
-	if f.Error != "" {
-		s.logger.Warn("relay reported error", "stream", f.StreamID, "error", f.Error)
-		s.heartbeat.recordError(f.Error)
-	}
-}
-
-func (s *session) handleWindow(f protocol.Frame) {
-	if f.Window <= 0 {
+func (s *session) handleWindow(update protocol.WindowUpdate) {
+	if update.Delta == 0 {
 		return
 	}
-	stream := s.getStream(f.StreamID)
+	stream := s.getStream(update.StreamID)
 	if stream == nil {
-		s.logger.Debug("window update for unknown stream", "stream", f.StreamID)
+		s.logger.Debug("window update for unknown stream", "stream", update.StreamID)
 		return
 	}
-	stream.release(f.Window)
+	stream.release(int(update.Delta))
 }
 
-func (s *session) handleHeartbeat(f protocol.Frame) {
-	payload := f.Heartbeat
+func (s *session) handleHeartbeat(payload *protocol.HeartbeatPayload) {
 	if payload == nil {
-		s.logger.Warn("heartbeat frame missing payload")
+		s.logger.Warn("heartbeat packet missing payload")
 		return
 	}
 
@@ -457,21 +473,16 @@ func (s *session) handleHeartbeat(f protocol.Frame) {
 		s.heartbeat.handleAck(payload.Sequence, ackTime)
 		_ = s.conn.SetReadDeadline(time.Now().Add(heartbeatTimeout))
 	case protocol.HeartbeatModePing:
-		reply := &protocol.Frame{
-			Type: protocol.FrameTypeHeartbeat,
-			Heartbeat: &protocol.HeartbeatPayload{
-				Sequence: payload.Sequence,
-				SentAt:   payload.SentAt,
-				Mode:     protocol.HeartbeatModePong,
-			},
-		}
-		if err := s.sendFrame(reply); err != nil {
+		if err := s.sendHeartbeatPacket(&protocol.HeartbeatPayload{
+			Sequence: payload.Sequence,
+			SentAt:   payload.SentAt,
+			Mode:     protocol.HeartbeatModePong,
+		}); err != nil {
 			s.logger.Debug("heartbeat pong failed", "error", err)
 			s.heartbeat.markSendFailure()
-			return
 		}
 	default:
-		s.logger.Warn("heartbeat frame with unknown mode", "mode", payload.Mode)
+		s.logger.Warn("heartbeat packet with unknown mode", "mode", payload.Mode)
 	}
 }
 
@@ -551,18 +562,13 @@ func (s *session) sendHeartbeat() {
 			payload.Stats.DataQueueDepth = dataDepth
 		}
 	}
-	frame := &protocol.Frame{
-		Type:      protocol.FrameTypeHeartbeat,
-		Heartbeat: payload,
-	}
-	if err := s.sendFrame(frame); err != nil {
+	if err := s.sendHeartbeatPacket(payload); err != nil {
 		s.logger.Debug("heartbeat send failed", "error", err)
 		s.heartbeat.markSendFailure()
-		return
 	}
 }
 
-func (s *session) handleBinaryWrite(streamID string, payload []byte, release func()) {
+func (s *session) handleBinaryWrite(streamID uint64, payload []byte, release func()) {
 	stream := s.getStream(streamID)
 	if stream == nil {
 		if release != nil {
@@ -586,37 +592,71 @@ func (s *session) handleBinaryWriteWithStream(stream *agentStream, payload []byt
 		s.logger.Warn("stream enqueue failed", "stream", stream.id, "error", err)
 		s.heartbeat.recordError(err.Error())
 		stream.close()
-		_ = s.sendFrame(&protocol.Frame{
-			Type:     protocol.FrameTypeError,
+		_ = s.sendClose(protocol.ClosePacket{
 			StreamID: stream.id,
-			Error:    err.Error(),
+			Code:     protocol.CloseCodeBackpressure,
+			Message:  err.Error(),
 		})
 	}
 }
 
-func (s *session) sendFrame(f *protocol.Frame) error {
-	if f == nil {
+func (s *session) sendPacket(packet []byte) error {
+	if len(packet) == 0 {
 		return nil
 	}
-	return s.enqueueControl(outboundMessage{frame: f})
+	return s.enqueueControl(outboundMessage{packet: packet})
 }
 
-func (s *session) sendWindowUpdate(streamID string, delta int) error {
+func (s *session) sendHeartbeatPacket(payload *protocol.HeartbeatPayload) error {
+	if payload == nil {
+		return nil
+	}
+	return s.enqueueControl(outboundMessage{heartbeat: payload})
+}
+
+func (s *session) sendDialResponse(resp protocol.DialResponse) error {
+	packet, err := protocol.EncodeDialResponsePacket(resp)
+	if err != nil {
+		return err
+	}
+	return s.sendPacket(packet)
+}
+
+func (s *session) sendDiagnosticResponse(resp protocol.DiagnosticResponse) error {
+	packet, err := protocol.EncodeDiagnosticResponsePacket(resp)
+	if err != nil {
+		return err
+	}
+	return s.sendPacket(packet)
+}
+
+func (s *session) sendWindowUpdate(streamID uint64, delta int) error {
 	if delta <= 0 {
 		return nil
 	}
-	return s.sendFrame(&protocol.Frame{
-		Type:     protocol.FrameTypeWindow,
+	packet, err := protocol.EncodeWindowUpdatePacket(protocol.WindowUpdate{
 		StreamID: streamID,
-		Window:   delta,
+		Delta:    uint32(delta),
 	})
+	if err != nil {
+		return err
+	}
+	return s.sendPacket(packet)
 }
 
-func (s *session) sendBinary(streamID string, payload []byte, release func()) error {
+func (s *session) sendClose(closePacket protocol.ClosePacket) error {
+	packet, err := protocol.EncodeClosePacket(closePacket)
+	if err != nil {
+		return err
+	}
+	return s.sendPacket(packet)
+}
+
+func (s *session) sendBinary(streamID uint64, payload []byte, release func()) error {
 	msg := outboundMessage{
 		binaryStreamID: streamID,
 		binaryPayload:  payload,
-		onWrite: func(bool) {
+		onWriteComplete: func(bool) {
 			if release != nil {
 				release()
 			}
@@ -635,19 +675,19 @@ func (s *session) storeStream(stream *agentStream) error {
 	s.streamsMu.Lock()
 	defer s.streamsMu.Unlock()
 	if _, exists := s.streams[stream.id]; exists {
-		return fmt.Errorf("stream %s already exists", stream.id)
+		return fmt.Errorf("stream %d already exists", stream.id)
 	}
 	s.streams[stream.id] = stream
 	return nil
 }
 
-func (s *session) getStream(id string) *agentStream {
+func (s *session) getStream(id uint64) *agentStream {
 	s.streamsMu.RLock()
 	defer s.streamsMu.RUnlock()
 	return s.streams[id]
 }
 
-func (s *session) removeStream(id string) *agentStream {
+func (s *session) removeStream(id uint64) *agentStream {
 	s.streamsMu.Lock()
 	defer s.streamsMu.Unlock()
 	stream, ok := s.streams[id]
@@ -658,12 +698,15 @@ func (s *session) removeStream(id string) *agentStream {
 }
 
 func (s *session) pipeOutbound(stream *agentStream) {
+	closeCode := protocol.CloseCodeOK
+	closeMessage := ""
 	defer func() {
 		s.removeStream(stream.id)
 		stream.close()
-		_ = s.sendFrame(&protocol.Frame{
-			Type:     protocol.FrameTypeClose,
+		_ = s.sendClose(protocol.ClosePacket{
 			StreamID: stream.id,
+			Code:     closeCode,
+			Message:  closeMessage,
 		})
 	}()
 
@@ -678,10 +721,13 @@ func (s *session) pipeOutbound(stream *agentStream) {
 			releaseAgentBuffer(buf)
 		}
 	}()
+
 	for {
 		n, err := stream.conn.Read(buf[:bufferSize])
 		if n > 0 {
 			if !stream.acquire(n) {
+				closeCode = protocol.CloseCodeBackpressure
+				closeMessage = "stream window closed"
 				return
 			}
 			sendBuf := buf[:n]
@@ -690,6 +736,8 @@ func (s *session) pipeOutbound(stream *agentStream) {
 				releaseAgentBuffer(sendBuf)
 			}); errSend != nil {
 				stream.release(n)
+				closeCode = protocol.CloseCodeShutdown
+				closeMessage = errSend.Error()
 				s.logger.Warn("send payload failed", "stream", stream.id, "error", errSend)
 				return
 			}
@@ -697,16 +745,13 @@ func (s *session) pipeOutbound(stream *agentStream) {
 		}
 
 		if err != nil {
-			if errors.Is(err, io.EOF) {
+			if errors.Is(err, io.EOF) || util.IsExpectedNetClose(err) || stream.isClosed() {
 				return
 			}
+			closeCode = protocol.CloseCodeRemoteError
+			closeMessage = err.Error()
 			s.logger.Warn("stream read failed", "stream", stream.id, "error", err)
 			s.heartbeat.recordError(err.Error())
-			_ = s.sendFrame(&protocol.Frame{
-				Type:     protocol.FrameTypeError,
-				StreamID: stream.id,
-				Error:    err.Error(),
-			})
 			return
 		}
 	}

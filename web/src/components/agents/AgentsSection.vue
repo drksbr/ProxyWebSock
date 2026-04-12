@@ -1,7 +1,11 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, reactive, ref, watch } from "vue";
 
-import type { StatusAgent, StatusStream } from "../../types/status";
+import type {
+  StatusAgent,
+  StatusStream,
+  StatusUpdateCatalogEntry,
+} from "../../types/status";
 import {
   formatAbsolute,
   formatBytes,
@@ -13,11 +17,20 @@ import {
 
 const props = defineProps<{
   agents: StatusAgent[];
+  updateCatalog: StatusUpdateCatalogEntry[];
+}>();
+
+const emit = defineEmits<{
+  (e: "refreshRequested"): void;
 }>();
 
 const agentSearch = ref("");
 const connectionSearch = ref("");
 const expandedAgents = ref<Set<string>>(new Set());
+const deploymentSelections = reactive<Record<string, string>>({});
+const deploymentBusy = reactive<Record<string, boolean>>({});
+const deploymentMessage = reactive<Record<string, string>>({});
+const deploymentError = reactive<Record<string, string>>({});
 
 const filteredAgents = computed(() => {
   const query = agentSearch.value.trim().toLowerCase();
@@ -48,8 +61,9 @@ const degradedAgentsCount = computed(
 );
 
 watch(
-  () => props.agents.map((agent) => agent.id),
-  (ids) => {
+  () => props.agents,
+  (agents) => {
+    const ids = agents.map((agent) => agent.id);
     const available = new Set(ids);
     const next = new Set<string>();
     expandedAgents.value.forEach((id) => {
@@ -58,6 +72,12 @@ watch(
       }
     });
     expandedAgents.value = next;
+
+    agents.forEach((agent) => {
+      if (!deploymentSelections[agent.id]) {
+        deploymentSelections[agent.id] = agent.pinnedVersion || "latest";
+      }
+    });
   },
   { immediate: true },
 );
@@ -125,6 +145,97 @@ function agentCardClasses(agent: StatusAgent): string {
   }
   return base;
 }
+
+function updateCatalogEntry(agent: StatusAgent) {
+  return props.updateCatalog.find(
+    (entry) => entry.goos === agent.goos && entry.goarch === agent.goarch,
+  );
+}
+
+function versionsForAgent(agent: StatusAgent): string[] {
+  return updateCatalogEntry(agent)?.versions ?? [];
+}
+
+function latestVersionForAgent(agent: StatusAgent): string {
+  return updateCatalogEntry(agent)?.latestVersion ?? "";
+}
+
+function selectedDeployment(agent: StatusAgent): string {
+  return deploymentSelections[agent.id] || agent.pinnedVersion || "latest";
+}
+
+function currentVersionLabel(agent: StatusAgent): string {
+  return agent.currentVersion || "-";
+}
+
+function desiredVersionLabel(agent: StatusAgent): string {
+  if (agent.desiredVersion) {
+    return agent.desiredVersion;
+  }
+  return latestVersionForAgent(agent) || "-";
+}
+
+function trackLabel(agent: StatusAgent): string {
+  return agent.updateTrack === "pinned" ? "fixado" : "latest";
+}
+
+function canManageDeployment(agent: StatusAgent): boolean {
+  return Boolean(agent.goos && agent.goarch && versionsForAgent(agent).length);
+}
+
+function resolutionSourceLabel(source?: string): string {
+  switch (source) {
+    case "override":
+      return "override";
+    case "dns-cache":
+      return "dns cache";
+    case "dns":
+      return "dns local";
+    case "literal":
+      return "ip literal";
+    default:
+      return source || "-";
+  }
+}
+
+async function applyDeployment(agent: StatusAgent) {
+  deploymentBusy[agent.id] = true;
+  deploymentError[agent.id] = "";
+  deploymentMessage[agent.id] = "";
+
+  try {
+    const version = selectedDeployment(agent);
+    const res = await fetch(`/api/agents/${encodeURIComponent(agent.id)}/deployment`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        version: version === "latest" ? "" : version,
+        goos: agent.goos,
+        goarch: agent.goarch,
+        forceCheck: true,
+      }),
+    });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const payload = (await res.json()) as {
+      desiredVersion?: string;
+      forceDispatched?: boolean;
+    };
+    deploymentSelections[agent.id] = version;
+    deploymentMessage[agent.id] = payload.forceDispatched
+      ? "Deployment salvo e check imediato enviado."
+      : "Deployment salvo. O agente vai aplicar no próximo poll HTTP.";
+    emit("refreshRequested");
+  } catch (err) {
+    deploymentError[agent.id] =
+      err instanceof Error ? err.message : "Falha ao aplicar deployment.";
+  } finally {
+    deploymentBusy[agent.id] = false;
+  }
+}
 </script>
 
 <template>
@@ -190,6 +301,12 @@ function agentCardClasses(agent: StatusAgent): string {
                 Último heartbeat {{ formatRelative(agent.lastHeartbeatAt) }}
               </template>
               <template v-else> Último heartbeat: - </template>
+            </div>
+            <div v-if="agent.currentVersion || agent.goos" class="text-xs text-slate-500">
+              <span v-if="agent.currentVersion">Versão {{ agent.currentVersion }}</span>
+              <span v-if="agent.goos && agent.goarch">
+                {{ agent.currentVersion ? " · " : "" }}{{ agent.goos }}/{{ agent.goarch }}
+              </span>
             </div>
           </div>
           <div class="flex flex-wrap items-center gap-3">
@@ -261,6 +378,33 @@ function agentCardClasses(agent: StatusAgent): string {
             </div>
             <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
               <div class="text-xs uppercase tracking-wide text-slate-500">
+                Plataforma
+              </div>
+              <div class="font-mono text-sm text-slate-100">
+                {{ agent.goos && agent.goarch ? `${agent.goos}/${agent.goarch}` : "-" }}
+              </div>
+            </div>
+            <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
+              <div class="text-xs uppercase tracking-wide text-slate-500">
+                Versão atual
+              </div>
+              <div class="font-mono text-sm text-slate-100">
+                {{ currentVersionLabel(agent) }}
+              </div>
+            </div>
+            <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
+              <div class="text-xs uppercase tracking-wide text-slate-500">
+                Deployment alvo
+              </div>
+              <div class="font-mono text-sm text-slate-100">
+                {{ desiredVersionLabel(agent) }}
+              </div>
+              <div class="mt-1 text-xs text-slate-500">
+                Modo {{ trackLabel(agent) }}
+              </div>
+            </div>
+            <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
+              <div class="text-xs uppercase tracking-wide text-slate-500">
                 Auto Config
               </div>
               <template v-if="agent.autoConfig">
@@ -283,6 +427,55 @@ function agentCardClasses(agent: StatusAgent): string {
                 </div>
               </div>
               <div v-else class="text-slate-500">Nenhum</div>
+            </div>
+          </div>
+
+          <div class="rounded-lg border border-slate-800 bg-slate-900/70 p-4">
+            <div class="mb-3 flex items-center justify-between gap-3">
+              <div>
+                <div class="text-xs uppercase tracking-wide text-slate-500">
+                  Deployment do agente
+                </div>
+                <div class="text-sm text-slate-300">
+                  Força upgrade ou downgrade por HTTP, sem depender do túnel WebSocket.
+                </div>
+              </div>
+              <div v-if="agent.lastUpdateCheckAt" class="text-xs text-slate-500">
+                Último poll {{ formatRelative(agent.lastUpdateCheckAt) }}
+              </div>
+            </div>
+            <div v-if="canManageDeployment(agent)" class="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto]">
+              <label class="flex flex-col gap-2 text-sm text-slate-300">
+                Versão alvo
+                <select
+                  v-model="deploymentSelections[agent.id]"
+                  class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none focus:ring-1 focus:ring-sky-400"
+                >
+                  <option value="latest">
+                    Seguir latest{{ latestVersionForAgent(agent) ? ` (${latestVersionForAgent(agent)})` : "" }}
+                  </option>
+                  <option v-for="releaseVersion in versionsForAgent(agent)" :key="releaseVersion" :value="releaseVersion">
+                    {{ releaseVersion }}
+                  </option>
+                </select>
+              </label>
+              <button
+                type="button"
+                class="rounded-lg border border-sky-500/50 bg-sky-500/15 px-4 py-2 text-sm font-semibold text-sky-100 transition hover:bg-sky-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+                :disabled="deploymentBusy[agent.id]"
+                @click="applyDeployment(agent)"
+              >
+                {{ deploymentBusy[agent.id] ? "Aplicando..." : "Aplicar e forçar check" }}
+              </button>
+            </div>
+            <div v-else class="rounded-lg border border-dashed border-slate-800 bg-slate-900/80 p-3 text-sm text-slate-400">
+              Plataforma ainda não identificada ou sem artefatos publicados para esse agente.
+            </div>
+            <div v-if="deploymentMessage[agent.id]" class="mt-3 text-sm text-emerald-300">
+              {{ deploymentMessage[agent.id] }}
+            </div>
+            <div v-if="deploymentError[agent.id]" class="mt-3 text-sm text-rose-300">
+              {{ deploymentError[agent.id] }}
             </div>
           </div>
 
@@ -437,7 +630,33 @@ function agentCardClasses(agent: StatusAgent): string {
                         {{ stream.streamId }}
                       </td>
                       <td class="px-3 py-2 font-mono text-xs text-slate-300">
-                        {{ stream.target }}
+                        <div>{{ stream.target }}</div>
+                        <div v-if="stream.resolvedTarget" class="mt-1 text-[11px] text-slate-500">
+                          {{ stream.resolvedTarget }}
+                          <span v-if="stream.resolutionSource">
+                            · {{ resolutionSourceLabel(stream.resolutionSource) }}
+                          </span>
+                        </div>
+                        <div
+                          v-if="stream.groupName || stream.profileName || stream.principalName"
+                          class="mt-1 text-[11px] text-slate-500"
+                        >
+                          <span v-if="stream.principalName">
+                            {{ stream.principalType || "principal" }}: {{ stream.principalName }}
+                          </span>
+                          <span v-if="stream.groupName">
+                            · grupo: {{ stream.groupName }}
+                          </span>
+                          <span v-if="stream.profileName">
+                            · perfil: {{ stream.profileName }}
+                          </span>
+                        </div>
+                        <div v-if="stream.routeReasonCode" class="mt-1 font-mono text-[11px] text-slate-600">
+                          {{ stream.routeReasonCode }}
+                        </div>
+                        <div v-if="stream.routeReason" class="mt-1 text-[11px] text-slate-600">
+                          {{ stream.routeReason }}
+                        </div>
                       </td>
                       <td class="px-3 py-2 uppercase text-xs text-slate-200">
                         {{ stream.protocol }}

@@ -32,6 +32,14 @@ type relayOptions struct {
 	acmeCache        string
 	acmeHTTPAddr     string
 	updatesDir       string
+	controlPlaneDB   string
+	dnsOverridesFile string
+	autoconfigSecret string
+	breakerFailures  int
+	breakerCooldown  time.Duration
+	userStreamQuota  int
+	groupStreamQuota int
+	agentStreamQuota int
 	streamIDMode     string
 	configFile       string
 }
@@ -54,14 +62,24 @@ type relayFileConfig struct {
 	ACMECache        string        `yaml:"acme_cache"`
 	ACMEHTTP         string        `yaml:"acme_http"`
 	UpdatesDir       string        `yaml:"updates_dir"`
+	ControlPlaneDB   string        `yaml:"control_plane_db"`
+	DNSOverridesFile string        `yaml:"dns_overrides_file"`
+	AutoconfigSecret string        `yaml:"autoconfig_secret"`
+	BreakerFailures  int           `yaml:"breaker_failures"`
+	BreakerCooldown  time.Duration `yaml:"breaker_cooldown"`
+	UserStreamQuota  int           `yaml:"user_stream_quota"`
+	GroupStreamQuota int           `yaml:"group_stream_quota"`
+	AgentStreamQuota int           `yaml:"agent_stream_quota"`
 	StreamIDMode     string        `yaml:"stream_id_mode"`
 }
 
 type relayCounters struct {
-	bytesUp      atomic.Int64
-	bytesDown    atomic.Int64
-	dialErrors   atomic.Int64
-	authFailures atomic.Int64
+	bytesUp        atomic.Int64
+	bytesDown      atomic.Int64
+	dialErrors     atomic.Int64
+	authFailures   atomic.Int64
+	routeDecisions atomic.Int64
+	routeFailures  atomic.Int64
 }
 
 func (o *relayOptions) loadConfiguration() error {
@@ -133,6 +151,30 @@ func (o *relayOptions) applyFileConfig(cfg relayFileConfig) {
 	if cfg.UpdatesDir != "" {
 		o.updatesDir = cfg.UpdatesDir
 	}
+	if cfg.ControlPlaneDB != "" {
+		o.controlPlaneDB = cfg.ControlPlaneDB
+	}
+	if cfg.DNSOverridesFile != "" {
+		o.dnsOverridesFile = cfg.DNSOverridesFile
+	}
+	if cfg.AutoconfigSecret != "" {
+		o.autoconfigSecret = cfg.AutoconfigSecret
+	}
+	if cfg.BreakerFailures > 0 {
+		o.breakerFailures = cfg.BreakerFailures
+	}
+	if cfg.BreakerCooldown > 0 {
+		o.breakerCooldown = cfg.BreakerCooldown
+	}
+	if cfg.UserStreamQuota > 0 {
+		o.userStreamQuota = cfg.UserStreamQuota
+	}
+	if cfg.GroupStreamQuota > 0 {
+		o.groupStreamQuota = cfg.GroupStreamQuota
+	}
+	if cfg.AgentStreamQuota > 0 {
+		o.agentStreamQuota = cfg.AgentStreamQuota
+	}
 	if cfg.StreamIDMode != "" {
 		o.streamIDMode = cfg.StreamIDMode
 	}
@@ -160,6 +202,14 @@ func (o *relayOptions) applyEnvOverrides() {
 	o.acmeCache = config.GetStringEnv("INTRATUN_RELAY_ACME_CACHE", o.acmeCache)
 	o.acmeHTTPAddr = config.GetStringEnv("INTRATUN_RELAY_ACME_HTTP", o.acmeHTTPAddr)
 	o.updatesDir = config.GetStringEnv("INTRATUN_RELAY_UPDATES_DIR", o.updatesDir)
+	o.controlPlaneDB = config.GetStringEnv("INTRATUN_RELAY_CONTROL_PLANE_DB", o.controlPlaneDB)
+	o.dnsOverridesFile = config.GetStringEnv("INTRATUN_RELAY_DNS_OVERRIDES_FILE", o.dnsOverridesFile)
+	o.autoconfigSecret = config.GetStringEnv("INTRATUN_RELAY_AUTOCONFIG_SECRET", o.autoconfigSecret)
+	o.breakerFailures = config.GetIntEnv("INTRATUN_RELAY_BREAKER_FAILURES", o.breakerFailures)
+	o.breakerCooldown = config.GetDurationEnv("INTRATUN_RELAY_BREAKER_COOLDOWN", o.breakerCooldown)
+	o.userStreamQuota = config.GetIntEnv("INTRATUN_RELAY_USER_STREAM_QUOTA", o.userStreamQuota)
+	o.groupStreamQuota = config.GetIntEnv("INTRATUN_RELAY_GROUP_STREAM_QUOTA", o.groupStreamQuota)
+	o.agentStreamQuota = config.GetIntEnv("INTRATUN_RELAY_AGENT_STREAM_QUOTA", o.agentStreamQuota)
 	o.streamIDMode = config.GetStringEnv("INTRATUN_RELAY_STREAM_ID_MODE", o.streamIDMode)
 }
 
@@ -169,12 +219,17 @@ func NewCommand(globals *runtime.Options) *cobra.Command {
 		secureListen:     ":8443",
 		socksListen:      "",
 		maxFrame:         128 * 1024,
-		maxInFlight:      4 * 1024 * 1024,
-		streamQueueDepth: 1024,
+		maxInFlight:      16 * 1024 * 1024,
+		streamQueueDepth: 2048,
 		wsIdle:           45 * time.Second,
 		dialTimeoutMs:    10000,
 		acmeHTTPAddr:     "",
-		streamIDMode:     "uuid",
+		breakerFailures:  3,
+		breakerCooldown:  30 * time.Second,
+		userStreamQuota:  0,
+		groupStreamQuota: 0,
+		agentStreamQuota: 0,
+		streamIDMode:     "counter",
 	}
 
 	cmd := &cobra.Command{
@@ -223,7 +278,15 @@ func NewCommand(globals *runtime.Options) *cobra.Command {
 	cmd.Flags().StringVar(&opts.acmeCache, "acme-cache", "", "directory for ACME certificate cache")
 	cmd.Flags().StringVar(&opts.acmeHTTPAddr, "acme-http", opts.acmeHTTPAddr, "optional listen address for ACME HTTP-01 challenges (e.g. :80)")
 	cmd.Flags().StringVar(&opts.updatesDir, "updates-dir", "", "optional directory served under /updates/ for automatic agent updates")
-	cmd.Flags().StringVar(&opts.streamIDMode, "stream-id-mode", opts.streamIDMode, "stream identifier generator (uuid or cuid)")
+	cmd.Flags().StringVar(&opts.controlPlaneDB, "control-plane-db", "", "SQLite database path for control-plane state (use :memory: to disable persistence)")
+	cmd.Flags().StringVar(&opts.dnsOverridesFile, "dns-overrides-file", "", "YAML file used to persist dashboard DNS/IP overrides")
+	cmd.Flags().StringVar(&opts.autoconfigSecret, "autoconfig-secret", "", "HMAC secret used to mint user-scoped PAC/autoconfig URLs (defaults to dashboard password when set)")
+	cmd.Flags().IntVar(&opts.breakerFailures, "breaker-failures", opts.breakerFailures, "consecutive dial/diagnostic failures before opening a destination circuit breaker")
+	cmd.Flags().DurationVar(&opts.breakerCooldown, "breaker-cooldown", opts.breakerCooldown, "cooldown before a half-open probe is allowed for a destination circuit breaker")
+	cmd.Flags().IntVar(&opts.userStreamQuota, "user-stream-quota", opts.userStreamQuota, "maximum concurrent active streams per relay user (0 disables)")
+	cmd.Flags().IntVar(&opts.groupStreamQuota, "group-stream-quota", opts.groupStreamQuota, "maximum concurrent active streams per agent group (0 disables)")
+	cmd.Flags().IntVar(&opts.agentStreamQuota, "agent-stream-quota", opts.agentStreamQuota, "maximum concurrent active streams per connected agent (0 disables)")
+	cmd.Flags().StringVar(&opts.streamIDMode, "stream-id-mode", opts.streamIDMode, "stream identifier mode (counter/uint64 preferred; uuid/cuid accepted as compatibility aliases)")
 
 	return cmd
 }

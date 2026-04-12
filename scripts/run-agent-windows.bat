@@ -12,6 +12,6 @@ if not exist "%BINARY%" (
   exit /b 1
 )
 
-"%BINARY%" agent --relay=wss://relay.neurocirurgiahgrs.com.br/tunnel --id=agente01 --token=troque-esta-senha --dial-timeout-ms=30000 --max-frame=8192 --read-buf=16384 --write-buf=16384 --log-level=error
+"%BINARY%" agent --relay=wss://relay.neurocirurgiahgrs.com.br/tunnel --id=agente01 --token=troque-esta-senha --dial-timeout-ms=30000 --max-frame=131072 --max-inflight=16777216 --stream-queue-depth=512 --read-buf=262144 --write-buf=262144 --log-level=info
 
 endlocal

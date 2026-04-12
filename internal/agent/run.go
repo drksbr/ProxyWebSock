@@ -18,17 +18,19 @@ import (
 )
 
 type agent struct {
-	opts   *options
-	logger *slog.Logger
-	rngMu  sync.Mutex
-	rng    *rand.Rand
-	update sync.Mutex
+	opts     *options
+	logger   *slog.Logger
+	rngMu    sync.Mutex
+	rng      *rand.Rand
+	update   sync.Mutex
+	resolver *dialResolver
 }
 
 func (o *options) run(ctx context.Context) error {
 	a := &agent{
-		opts:   o,
-		logger: o.logger,
+		opts:     o,
+		logger:   o.logger,
+		resolver: newDialResolver(o.resolverConfig()),
 	}
 	return a.run(ctx)
 }
