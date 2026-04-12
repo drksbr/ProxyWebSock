@@ -34,6 +34,7 @@ type relayOptions struct {
 	updatesDir       string
 	controlPlaneDB   string
 	dnsOverridesFile string
+	plainListen      string
 	autoconfigSecret string
 	breakerFailures  int
 	breakerCooldown  time.Duration
@@ -64,6 +65,7 @@ type relayFileConfig struct {
 	UpdatesDir       string        `yaml:"updates_dir"`
 	ControlPlaneDB   string        `yaml:"control_plane_db"`
 	DNSOverridesFile string        `yaml:"dns_overrides_file"`
+	PlainListen      string        `yaml:"plain_listen"`
 	AutoconfigSecret string        `yaml:"autoconfig_secret"`
 	BreakerFailures  int           `yaml:"breaker_failures"`
 	BreakerCooldown  time.Duration `yaml:"breaker_cooldown"`
@@ -157,6 +159,9 @@ func (o *relayOptions) applyFileConfig(cfg relayFileConfig) {
 	if cfg.DNSOverridesFile != "" {
 		o.dnsOverridesFile = cfg.DNSOverridesFile
 	}
+	if cfg.PlainListen != "" {
+		o.plainListen = cfg.PlainListen
+	}
 	if cfg.AutoconfigSecret != "" {
 		o.autoconfigSecret = cfg.AutoconfigSecret
 	}
@@ -201,6 +206,7 @@ func (o *relayOptions) applyEnvOverrides() {
 	o.acmeEmail = config.GetStringEnv("INTRATUN_RELAY_ACME_EMAIL", o.acmeEmail)
 	o.acmeCache = config.GetStringEnv("INTRATUN_RELAY_ACME_CACHE", o.acmeCache)
 	o.acmeHTTPAddr = config.GetStringEnv("INTRATUN_RELAY_ACME_HTTP", o.acmeHTTPAddr)
+	o.plainListen = config.GetStringEnv("INTRATUN_RELAY_PLAIN_LISTEN", o.plainListen)
 	o.updatesDir = config.GetStringEnv("INTRATUN_RELAY_UPDATES_DIR", o.updatesDir)
 	o.controlPlaneDB = config.GetStringEnv("INTRATUN_RELAY_CONTROL_PLANE_DB", o.controlPlaneDB)
 	o.dnsOverridesFile = config.GetStringEnv("INTRATUN_RELAY_DNS_OVERRIDES_FILE", o.dnsOverridesFile)
@@ -263,6 +269,7 @@ func NewCommand(globals *runtime.Options) *cobra.Command {
 	cmd.Flags().StringVar(&opts.configFile, "config", "", "path to relay YAML configuration file")
 	cmd.Flags().StringVar(&opts.proxyListen, "proxy-listen", opts.proxyListen, "listen address for HTTP CONNECT proxy (plain HTTP)")
 	cmd.Flags().StringVar(&opts.secureListen, "secure-listen", opts.secureListen, "listen address for TLS endpoints (/tunnel, /, /metrics)")
+	cmd.Flags().StringVar(&opts.plainListen, "plain-listen", opts.plainListen, "listen address for plain HTTP endpoints when behind a reverse proxy (no TLS; skips ACME requirement)")
 	cmd.Flags().StringVar(&opts.socksListen, "socks-listen", opts.socksListen, "optional listen address for SOCKS5 proxy (plain TCP)")
 	cmd.Flags().StringVar(&opts.agentConfig, "agent-config", "", "path to YAML file containing agent definitions")
 	cmd.Flags().StringVar(&opts.dashboardUser, "dashboard-user", "", "optional HTTP Basic Auth username for the dashboard")

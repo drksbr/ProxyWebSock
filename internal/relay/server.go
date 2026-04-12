@@ -46,6 +46,7 @@ type relayServer struct {
 	statusTmpl  *template.Template
 	proxySrv    *http.Server
 	secureSrv   *http.Server
+	plainSrv    *http.Server
 	acmeSrv     *http.Server
 	secureLn    net.Listener
 	socksLn     net.Listener
@@ -103,8 +104,8 @@ func newRelayServer(logger *slog.Logger, opts *relayOptions) (*relayServer, erro
 		return nil, errors.New("--stream-queue-depth must be positive")
 	}
 
-	if len(opts.acmeHosts) == 0 {
-		return nil, errors.New("at least one --acme-host is required for Let's Encrypt")
+	if len(opts.acmeHosts) == 0 && strings.TrimSpace(opts.plainListen) == "" {
+		return nil, errors.New("at least one --acme-host is required for Let's Encrypt (or use --plain-listen to run behind a reverse proxy)")
 	}
 
 	metrics := newRelayMetrics()
@@ -254,7 +255,7 @@ func (s *relayServer) run(ctx context.Context) error {
 		}
 	}
 
-	if s.opts.acmeHTTPAddr != "" {
+	if s.opts.acmeHTTPAddr != "" && len(s.opts.acmeHosts) > 0 {
 		s.acmeSrv = &http.Server{
 			Addr:              s.opts.acmeHTTPAddr,
 			Handler:           s.acmeManager.HTTPHandler(nil),
@@ -319,19 +320,35 @@ func (s *relayServer) run(ctx context.Context) error {
 		TLSConfig:         s.acmeManager.TLSConfig(),
 	}
 
-	go func() {
-		ln, err := net.Listen("tcp", s.opts.secureListen)
-		if err != nil {
-			sendErr(fmt.Errorf("secure listen: %w", err))
-			return
+	if strings.TrimSpace(s.opts.plainListen) != "" {
+		s.plainSrv = &http.Server{
+			Addr:              s.opts.plainListen,
+			Handler:           secureMux,
+			ReadHeaderTimeout: 10 * time.Second,
 		}
-		s.secureLn = ln
-		s.logger.Info("secure listening", "addr", s.opts.secureListen, "hosts", strings.Join(s.opts.acmeHosts, ","))
-		tlsListener := tls.NewListener(ln, s.secureSrv.TLSConfig)
-		if err := s.secureSrv.Serve(tlsListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			sendErr(fmt.Errorf("secure serve: %w", err))
-		}
-	}()
+		go func() {
+			s.logger.Info("plain listening (reverse-proxy mode)", "addr", s.opts.plainListen)
+			if err := s.plainSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				sendErr(fmt.Errorf("plain serve: %w", err))
+			}
+		}()
+	}
+
+	if len(s.opts.acmeHosts) > 0 {
+		go func() {
+			ln, err := net.Listen("tcp", s.opts.secureListen)
+			if err != nil {
+				sendErr(fmt.Errorf("secure listen: %w", err))
+				return
+			}
+			s.secureLn = ln
+			s.logger.Info("secure listening", "addr", s.opts.secureListen, "hosts", strings.Join(s.opts.acmeHosts, ","))
+			tlsListener := tls.NewListener(ln, s.secureSrv.TLSConfig)
+			if err := s.secureSrv.Serve(tlsListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				sendErr(fmt.Errorf("secure serve: %w", err))
+			}
+		}()
+	}
 
 	if s.opts.socksListen != "" {
 		go func() {
@@ -358,6 +375,11 @@ func (s *relayServer) run(ctx context.Context) error {
 	if s.secureSrv != nil {
 		if errShutdown := s.secureSrv.Shutdown(shutdownCtx); errShutdown != nil {
 			s.logger.Warn("secure shutdown", "error", errShutdown)
+		}
+	}
+	if s.plainSrv != nil {
+		if errShutdown := s.plainSrv.Shutdown(shutdownCtx); errShutdown != nil {
+			s.logger.Warn("plain shutdown", "error", errShutdown)
 		}
 	}
 	if s.acmeSrv != nil {
