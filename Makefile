@@ -147,11 +147,12 @@ run: build
 	@[ -f .env ] || (echo "Arquivo .env não encontrado. Copie .env.example ou crie um com as variáveis necessárias."; exit 1)
 	@source .env && \
 	PLAIN=$${INTRATUN_PLAIN_LISTEN:-} && \
+	PROXY=$${INTRATUN_PROXY_LISTEN:-:8080} && \
 	if [ -n "$$PLAIN" ]; then \
 		$(BINARY) relay \
 			--agent-config ./config/agents.example.yaml \
 			--plain-listen=$$PLAIN \
-			--proxy-listen=:8080 \
+			--proxy-listen=$$PROXY \
 			--socks-listen=:1080 \
 			--dashboard-user=$${INTRATUN_DASHBOARD_USER:?defina INTRATUN_DASHBOARD_USER em .env} \
 			--dashboard-pass=$${INTRATUN_DASHBOARD_PASS:?defina INTRATUN_DASHBOARD_PASS em .env}; \
@@ -162,7 +163,7 @@ run: build
 			--acme-email=$${INTRATUN_ACME_EMAIL:?defina INTRATUN_ACME_EMAIL em .env} \
 			--acme-cache=/var/lib/intratun/acme \
 			--acme-http=:80 \
-			--proxy-listen=:8080 \
+			--proxy-listen=$$PROXY \
 			--secure-listen=:443 \
 			--socks-listen=:1080 \
 			--dashboard-user=$${INTRATUN_DASHBOARD_USER:?defina INTRATUN_DASHBOARD_USER em .env} \
