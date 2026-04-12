@@ -10,14 +10,10 @@ import {
 
 import AppHeader from "./components/AppHeader.vue";
 import AgentsSection from "./components/agents/AgentsSection.vue";
-import AuditSection from "./components/audit/AuditSection.vue";
-import AccessControlSection from "./components/controlplane/AccessControlSection.vue";
-import ControlPlaneSection from "./components/controlplane/ControlPlaneSection.vue";
+import ConfigSection from "./components/config/ConfigSection.vue";
 import DiagnosticsSection from "./components/diagnostics/DiagnosticsSection.vue";
-import DNSOverridesSection from "./components/dns/DNSOverridesSection.vue";
+import EventsSection from "./components/events/EventsSection.vue";
 import ResourcesSection from "./components/resources/ResourcesSection.vue";
-import RoutingSection from "./components/routing/RoutingSection.vue";
-import SupportSection from "./components/support/SupportSection.vue";
 import SummarySection from "./components/summary/SummarySection.vue";
 import { FRONTEND_VERSION } from "./version";
 import type {
@@ -63,6 +59,15 @@ const REFRESH_OPTIONS = [
 const MAX_HISTORY_MINUTES = Math.max(
   ...RANGE_OPTIONS.map((option) => option.minutes),
 );
+
+type TabId = "overview" | "agents" | "config" | "events" | "diagnostics";
+const VALID_TABS: TabId[] = ["overview", "agents", "config", "events", "diagnostics"];
+const activeTab = ref<TabId>("overview");
+
+function setTab(tab: TabId) {
+  activeTab.value = tab;
+  window.location.hash = tab;
+}
 
 const emptyPoint: ResourcePoint = {
   timestamp: "",
@@ -134,8 +139,6 @@ const netRates = reactive<NetworkRates>({ in: 0, out: 0 });
 const lastMetrics = ref<MetricsSnapshot | null>(null);
 const netHistory = ref<NetworkPoint[]>([]);
 const refreshIntervalMs = ref<number>(3000);
-const supportSearchQuery = ref("");
-const supportFailuresOnly = ref(false);
 const frontendVersion = FRONTEND_VERSION;
 let pollTimer: number | null = null;
 
@@ -147,28 +150,115 @@ const maxNetworkPoints = computed(
 const summaryCards = computed(() => {
   const metrics = data.value.metrics;
   const resources = data.value.resources.current;
+  const degradedAgents = data.value.agents.filter(
+    (a) => a.status === "degraded",
+  ).length;
+
+  const cpuSeverity: "normal" | "warn" | "danger" =
+    resources.cpuPercent > 90
+      ? "danger"
+      : resources.cpuPercent > 75
+        ? "warn"
+        : "normal";
+
+  const failureRate =
+    metrics.routeDecisions > 0
+      ? metrics.routeFailures / metrics.routeDecisions
+      : 0;
+  const routeSeverity: "normal" | "warn" | "danger" =
+    failureRate > 0.1 ? "danger" : failureRate > 0.05 ? "warn" : "normal";
+
+  const agentSeverity: "normal" | "warn" =
+    degradedAgents > 0 ? "warn" : "normal";
+
   return [
     {
       label: "Agentes Conectados",
-      value: formatCount(metrics.agentsConnected),
-    },
-    { label: "Streams Ativas", value: formatCount(metrics.activeStreams) },
-    { label: "CPU", value: formatPercent(resources.cpuPercent) },
-    { label: "Memória RSS", value: formatBytes(resources.rssBytes) },
-    { label: "Rede In", value: formatRate(netRates.in) },
-    { label: "Rede Out", value: formatRate(netRates.out) },
-    { label: "Rotas Selecionadas", value: formatCount(metrics.routeDecisions) },
-    { label: "Falhas de Rota", value: formatCount(metrics.routeFailures) },
-    {
-      label: "Bytes (cliente → intranet)",
-      value: formatBytes(metrics.bytesUp),
+      value: `${formatCount(metrics.agentsConnected)} / ${formatCount(data.value.agents.length)}`,
+      severity: agentSeverity,
     },
     {
-      label: "Bytes (intranet → cliente)",
-      value: formatBytes(metrics.bytesDown),
-    }
+      label: "Streams Ativas",
+      value: formatCount(metrics.activeStreams),
+      severity: "normal" as const,
+    },
+    {
+      label: "CPU",
+      value: formatPercent(resources.cpuPercent),
+      severity: cpuSeverity,
+    },
+    {
+      label: "Memória RSS",
+      value: formatBytes(resources.rssBytes),
+      severity: "normal" as const,
+    },
+    {
+      label: "Taxa In",
+      value: formatRate(netRates.in),
+      severity: "normal" as const,
+    },
+    {
+      label: "Taxa Out",
+      value: formatRate(netRates.out),
+      severity: "normal" as const,
+    },
+    {
+      label: "Decisões de Rota",
+      value: formatCount(metrics.routeDecisions),
+      severity: "normal" as const,
+    },
+    {
+      label: "Falhas de Rota",
+      value: formatCount(metrics.routeFailures),
+      severity: routeSeverity,
+    },
   ];
 });
+
+const dashboardAlerts = computed(() => {
+  const alerts: { message: string; severity: "warn" | "danger" }[] = [];
+  const degraded = data.value.agents.filter(
+    (a) => a.status === "degraded",
+  ).length;
+  const openBreakers = (data.value.support?.activeBreakers ?? []).filter(
+    (b) => b.state === "open",
+  ).length;
+  if (degraded > 0) {
+    alerts.push({
+      message: `${degraded} agente${degraded > 1 ? "s" : ""} degradado${degraded > 1 ? "s" : ""}`,
+      severity: "warn",
+    });
+  }
+  if (openBreakers > 0) {
+    alerts.push({
+      message: `${openBreakers} circuit breaker${openBreakers > 1 ? "s" : ""} aberto${openBreakers > 1 ? "s" : ""}`,
+      severity: "danger",
+    });
+  }
+  return alerts;
+});
+
+const agentsBadge = computed(() => {
+  const degraded = data.value.agents.filter(
+    (a) => a.status === "degraded",
+  ).length;
+  return degraded > 0 ? String(degraded) : undefined;
+});
+
+const eventsBadge = computed(() => {
+  const open = (data.value.support?.activeBreakers ?? []).filter(
+    (b) => b.state === "open",
+  ).length;
+  return open > 0 ? String(open) : undefined;
+});
+
+const tabs = computed(() => [
+  { id: "overview" as TabId, label: "Visão Geral", badge: undefined as string | undefined, badgeDanger: false },
+  { id: "agents" as TabId, label: "Agentes", badge: agentsBadge.value, badgeDanger: false },
+  { id: "config" as TabId, label: "Configuração", badge: undefined, badgeDanger: false },
+  { id: "events" as TabId, label: "Eventos", badge: eventsBadge.value, badgeDanger: true },
+  { id: "diagnostics" as TabId, label: "Diagnóstico", badge: undefined, badgeDanger: false },
+]);
 
 watch(refreshIntervalMs, () => {
   restartPolling();
@@ -206,6 +296,10 @@ watch(maxNetworkPoints, (limit) => {
 });
 
 onMounted(() => {
+  const hash = window.location.hash.replace("#", "") as TabId;
+  if (VALID_TABS.includes(hash)) {
+    activeTab.value = hash;
+  }
   schedulePoll();
 });
 
@@ -591,76 +685,103 @@ async function reloadStatusNow() {
 
 <template>
   <div class="min-h-screen bg-slate-950 text-slate-100">
-    <div class="mx-auto flex max-w-6xl flex-col gap-10 px-4 py-8">
-      <AppHeader
-        :proxy-addr="data.proxyAddr"
-        :secure-addr="data.secureAddr"
+    <!-- Header compacto fixo -->
+    <AppHeader
+      :proxy-addr="data.proxyAddr"
+      :secure-addr="data.secureAddr"
       :socks-addr="data.socksAddr"
       :acme-hosts="data.acmeHosts"
       :downloads="data.downloads ?? []"
       :backend-version="data.backendVersion ?? ''"
       :frontend-version="frontendVersion"
+      :refresh-options="REFRESH_OPTIONS"
+      :selected-interval="refreshIntervalMs"
+      @update:refresh-interval="handleRefreshInterval"
     />
 
-      <SummarySection :generated-at="data.generatedAt" :refresh-options="REFRESH_OPTIONS"
-        :selected-interval="refreshIntervalMs" :summary-cards="summaryCards"
-        @update:refresh-interval="handleRefreshInterval" />
+    <!-- Barra de abas (sticky, abaixo do header) -->
+    <div class="sticky top-[53px] z-30 border-b border-slate-800 bg-slate-950/95 backdrop-blur">
+      <div class="mx-auto max-w-7xl px-4">
+        <nav class="flex overflow-x-auto">
+          <button
+            v-for="tab in tabs"
+            :key="tab.id"
+            type="button"
+            class="flex shrink-0 items-center gap-2 border-b-2 px-4 py-3 text-sm font-medium transition"
+            :class="
+              activeTab === tab.id
+                ? 'border-sky-400 text-sky-100'
+                : 'border-transparent text-slate-400 hover:border-slate-600 hover:text-slate-200'
+            "
+            @click="setTab(tab.id)"
+          >
+            {{ tab.label }}
+            <span
+              v-if="tab.badge"
+              class="rounded-full px-1.5 py-0.5 text-[10px] font-bold leading-none"
+              :class="tab.badgeDanger ? 'bg-rose-500/30 text-rose-200' : 'bg-amber-500/30 text-amber-200'"
+            >{{ tab.badge }}</span>
+          </button>
+        </nav>
+      </div>
+    </div>
 
-      <ResourcesSection :resources="data.resources" :range-options="RANGE_OPTIONS" :selected-range="rangeMinutes"
-        :net-history="netHistory" @update:range="handleRangeUpdate" />
+    <!-- Conteúdo por aba -->
+    <div class="mx-auto max-w-7xl space-y-6 px-4 py-6">
+      <!-- Visão Geral -->
+      <template v-if="activeTab === 'overview'">
+        <SummarySection
+          :generated-at="data.generatedAt"
+          :summary-cards="summaryCards"
+          :alerts="dashboardAlerts"
+        />
+        <ResourcesSection
+          :resources="data.resources"
+          :range-options="RANGE_OPTIONS"
+          :selected-range="rangeMinutes"
+          :net-history="netHistory"
+          @update:range="handleRangeUpdate"
+        />
+      </template>
 
-      <SupportSection
-        :support="data.support ?? emptySupport"
-        :search-query="supportSearchQuery"
-        :failures-only="supportFailuresOnly"
-        @update:search-query="supportSearchQuery = $event"
-        @update:failures-only="supportFailuresOnly = $event"
-      />
+      <!-- Agentes -->
+      <template v-if="activeTab === 'agents'">
+        <AgentsSection
+          :agents="data.agents"
+          :update-catalog="data.updateCatalog ?? []"
+          @refresh-requested="reloadStatusNow"
+        />
+      </template>
 
-      <DiagnosticsSection
-        :agents="data.agents"
-        :agent-groups="data.agentGroups ?? []"
-        :destination-profiles="data.destinationProfiles ?? []"
-        :diagnostic-events="data.diagnosticEvents ?? []"
-        :search-query="supportSearchQuery"
-        :failures-only="supportFailuresOnly"
-      />
+      <!-- Configuração -->
+      <template v-if="activeTab === 'config'">
+        <ConfigSection
+          :agent-groups="data.agentGroups ?? []"
+          :destination-profiles="data.destinationProfiles ?? []"
+          :agents="data.agents"
+          :dns-overrides="data.dnsOverrides ?? []"
+          @refresh-requested="reloadStatusNow"
+        />
+      </template>
 
-      <AuditSection
-        :audit-events="data.auditEvents ?? []"
-        :search-query="supportSearchQuery"
-        :failures-only="supportFailuresOnly"
-      />
+      <!-- Eventos -->
+      <template v-if="activeTab === 'events'">
+        <EventsSection
+          :support="data.support ?? emptySupport"
+          :route-events="data.routeEvents ?? []"
+          :audit-events="data.auditEvents ?? []"
+        />
+      </template>
 
-      <RoutingSection
-        :route-events="data.routeEvents ?? []"
-        :search-query="supportSearchQuery"
-        :failures-only="supportFailuresOnly"
-      />
-
-      <DNSOverridesSection
-        :overrides="data.dnsOverrides ?? []"
-        @refresh-requested="reloadStatusNow"
-      />
-
-      <ControlPlaneSection
-        :agent-groups="data.agentGroups ?? []"
-        :destination-profiles="data.destinationProfiles ?? []"
-        @refresh-requested="reloadStatusNow"
-      />
-
-      <AccessControlSection
-        :agent-groups="data.agentGroups ?? []"
-        :destination-profiles="data.destinationProfiles ?? []"
-        :agents="data.agents"
-        @refresh-requested="reloadStatusNow"
-      />
-
-      <AgentsSection
-        :agents="data.agents"
-        :update-catalog="data.updateCatalog ?? []"
-        @refresh-requested="reloadStatusNow"
-      />
+      <!-- Diagnóstico -->
+      <template v-if="activeTab === 'diagnostics'">
+        <DiagnosticsSection
+          :agents="data.agents"
+          :agent-groups="data.agentGroups ?? []"
+          :destination-profiles="data.destinationProfiles ?? []"
+          :diagnostic-events="data.diagnosticEvents ?? []"
+        />
+      </template>
     </div>
   </div>
 </template>

@@ -11,6 +11,7 @@ defineProps<{
   support: StatusSupportSnapshot;
   searchQuery: string;
   failuresOnly: boolean;
+  hideFilter?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -73,7 +74,7 @@ function quotaBadgeClasses(counter: StatusQuotaCounter): string {
       </div>
     </div>
 
-    <div class="mb-4 grid gap-3 lg:grid-cols-[minmax(0,1fr)_220px_120px]">
+    <div v-if="!hideFilter" class="mb-4 grid gap-3 lg:grid-cols-[minmax(0,1fr)_220px_120px]">
       <label class="flex flex-col gap-2 text-sm font-medium text-slate-300">
         Filtro compartilhado
         <input
